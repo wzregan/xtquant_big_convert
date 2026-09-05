@@ -110,27 +110,27 @@ $env:PYTHONPATH = "D:\gjzqqmt\xtquant_big_convert\src;$env:PYTHONPATH"
 
 2026-09-05 工作区优化包含行情索引保真、按列编码协商、异步查询/撤单及缓存优化。
 同步撤单现在以 `result == 0` 判断成功。升级细节、离线基准和剩余接口差异见
-[性能优化与兼容性说明](PERFORMANCE_OPTIMIZATION_20260905.md)。
+[上游集成与当前兼容性说明](UPSTREAM_REVIEW_20260905.md)。
 
 | MiniQMT 调用 | 兼容状态 | 说明 |
 |---|---|---|
 | `XtQuantTrader(path, session_id)` | 已兼容 | 构造本地 RPC 客户端，不连接 MiniQMT |
-| `register_callback()` | 已接入 | 保存 callback；委托/成交事件经 Redis 推送，异步请求结果在客户端工作线程回调 |
+| `register_callback()` | 已接入 | 保存 callback；委托/成交事件经 Redis 或 ZMQ 推送，异步请求结果在客户端工作线程回调 |
 | `start()` / `connect()` / `subscribe()` | 已兼容 | 返回 `0`，`subscribe()` 会补账号 |
 | `query_stock_asset(acc)` | 已兼容 | 返回对象含 `cash`、`available_cash`、`total_asset`、`market_value` |
 | `query_stock_positions(acc)` | 已兼容 | 返回对象列表，含 `stock_code`、`volume`、`can_use_volume`、`avg_price`、`price` |
 | `query_stock_position(acc, code)` | 已兼容 | 返回单只持仓对象或 `None` |
 | `query_stock_orders(acc, cancelable_only=False)` | 已兼容 | 返回对象列表，含 `order_type`、`order_status`、`order_volume`、`traded_volume`、`order_sysid` |
 | `query_stock_trades(acc)` | 已兼容 | 返回对象列表，含 `order_type`、`traded_volume`、`traded_price` |
-| `order_stock()` / `order_stock_async()` | 部分兼容 | 策略名、备注可省略；委托号仍使用桥接系统号，非原生整数内部 ID；需要打开 `rpc_allow_order_methods=True` |
+| `order_stock()` / `order_stock_async()` | 部分兼容 | 策略名、备注可省略；同步返回整数子类 OrderId，异步返回 seq；OrderId 的 str 值为柜台系统号，整数值不等于原生内部 ID；需要打开 `rpc_allow_order_methods=True` |
 | `cancel_order_stock_sysid()` | 已接入 | 返回 `0` 成功、`-1` 失败；需要打开 `rpc_allow_order_methods=True` |
 | `query_stock_*_async()` / `query_account_*_async()` | 已接入 | 后台执行，支持原生 callback 位置参数；提供 callback 时返回 `None` |
-| `xtdata.get_full_tick(codes)` | 已兼容 | 默认直接 RPC 调用；支持单票、ETF、`["SH", "SZ"]` 全市场；可选打开 Redis 快照缓存 |
+| `xtdata.get_full_tick(codes)` | 已兼容 | 默认直接 RPC 调用；支持单票、ETF；`["SH", "SZ"]` 默认仅股票，全品种需 `types=["all"]`；可选打开 Redis 快照缓存 |
 | `xtdata.get_instrument_detail(code)` | 已兼容 | 映射到大 QMT `get_instrumentdetail()` |
 | `xtdata.get_instrument_type(code)` | 已接入 | 优先调大 QMT；不支持时按代码前缀做基础判断 |
-| `xtdata.subscribe_quote(...)` | 部分兼容 | 目前保存订阅并回调一次快照/历史数据，尚无原生单股连续订阅语义 |
+| `xtdata.subscribe_quote(...)` | 部分兼容 | tick 使用连续推送，K 线通过实时 RPC 轮询；时序仍与原生订阅存在差异 |
 | `xtdata.subscribe_whole_quote(...)` | 已接入 | 独立推送通道接收增量快照，包含订阅引用计数及心跳 |
-| `xtdata.unsubscribe_quote(seq)` | 已接入 | 全推订阅委托给订阅会话取消；旧单股订阅删除 Redis 订阅记录 |
+| `xtdata.unsubscribe_quote(seq)` | 已接入 | 取消推送会话或 K 线轮询并删除订阅记录 |
 | `xtdata.get_market_data(...)` | 已接入 RPC | 透传到大 QMT `ContextInfo.get_market_data`，返回 DataFrame/字典结构会自动 JSON 化再还原 |
 | `xtdata.get_market_data_ex(...)` | 已接入 RPC | 大 QMT 不支持 `get_market_data_ex` 时回退到 `get_market_data` |
 | `xtdata.get_local_data(...)` | 已接入 RPC | 大 QMT 不支持 `get_local_data` 时回退到 `get_market_data` |

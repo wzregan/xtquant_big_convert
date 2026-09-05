@@ -610,9 +610,9 @@ class ZmqTransport(RpcTransport):
         self._dealers = alive
 
     def _ensure_dealer(self):
-        """This thread's DEALER, created on first use."""
+        """首次使用或停止后重新使用时，为当前线程创建独占的 DEALER。"""
         sock = getattr(self._dealer_local, "sock", None)
-        if sock is not None:
+        if sock is not None and not sock.closed:
             return sock
         zmq, ctx = self._ensure_zmq()
         address = self._resolve_connect_address()
@@ -661,6 +661,7 @@ class ZmqTransport(RpcTransport):
 
     # -- lifecycle --------------------------------------------------------
     def stop(self):
+        """停止路由线程并关闭客户端句柄；客户端应先等待在途请求结束。"""
         super(ZmqTransport, self).stop()
         # Clear _running so the router loop exits; the loop closes its own
         # socket (closing cross-thread trips a Windows signaler abort).
@@ -686,12 +687,7 @@ class ZmqTransport(RpcTransport):
                 except Exception:
                     pass
             self._dealers = []
-        # The caller's own thread-local still points at a closed socket; drop
-        # it so a send_request after stop() builds a fresh one rather than
-        # raising on a dead handle. Other threads' locals are unreachable from
-        # here -- their sockets are closed above, and _ensure_dealer would hand
-        # back the closed one, so those threads must not reuse the transport
-        # after stop(). That was true of the single shared dealer too.
+        # 清理本线程引用；其他线程下次获取时会检查 closed 状态并重新建连。
         if getattr(self._dealer_local, "sock", None) is not None:
             self._dealer_local.sock = None
         # Do NOT terminate the shared context — other sockets/users may rely on it.

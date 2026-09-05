@@ -800,24 +800,17 @@ class AdjustedReadSelfHealTest(unittest.TestCase):
             [60.0, 60.0],
         )
 
-    def test_none_read_self_heals_missing_codes(self):
-        # Big QMT's raw store is not auto-populated market-wide; a
-        # none-adjusted pull that comes back missing requested codes means
-        # the server has no raw bars for them (2026-08-30 --tick pipeline:
-        # 5225 codes requested, only 8 came back) -- must heal like
-        # adjusted all-zero does.
+    def test_none_read_half_missing_does_not_trigger_healing(self):
+        """恰好一半缺码不代表原始库大范围缺失，避免每次读取都补数等待。"""
         xt = self._xt_missing()
         data = xt.get_market_data_ex(
             field_list=["close"], stock_list=["600000.SH", "000001.SZ"], period="1d",
             dividend_type="none",
         )
-        # After self-heal the retry returns both requested codes.
-        self.assertEqual(sorted(data.keys()), ["000001.SZ", "600000.SH"])
-        # The heal path must have triggered a server-side raw download.
+        self.assertEqual(sorted(data.keys()), ["600000.SH"])
         method_calls = [m for m, _ in xt.client.call_params]
-        self.assertIn("download_history_data2", method_calls)
-        # get_market_data_ex called twice: initial partial pull + retry.
-        self.assertEqual(method_calls.count("get_market_data_ex"), 2)
+        self.assertNotIn("download_history_data2", method_calls)
+        self.assertEqual(method_calls.count("get_market_data_ex"), 1)
 
     def test_none_read_majority_missing_self_heals(self):
         # The steady 2026-08-30 shape (5225 requested, 8 served ~ 0.15%):

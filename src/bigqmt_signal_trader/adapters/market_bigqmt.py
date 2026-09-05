@@ -104,47 +104,47 @@ def _float_or_none(value):
 
 
 def _row_day(row):
-    """The YYYYMMDD a bar belongs to, from whichever time column it carries.
+    """从行情行提取 YYYYMMDD，区分日历日期、日期时间和秒／毫秒时间戳。"""
+    import datetime as _d
 
-    Bars come back keyed on stime/time/date depending on the build, and the
-    value may be a millisecond epoch, a 'YYYY-MM-DD ...' string, or already a
-    plain YYYYMMDD. Only the day matters here (issue #165 probes one day at a
-    time), so normalise to that and give up quietly on anything else.
-    """
     for key in ("stime", "time", "date", "datetime", "timetag"):
         raw = row.get(key)
-        if raw in (None, ""):
+        if raw is None:
             continue
         text = str(raw).strip()
-        digits = "".join(ch for ch in text if ch.isdigit())
-        if len(digits) >= 13:                      # ms epoch
-            try:
-                import datetime as _d
-
-                return _d.datetime.fromtimestamp(int(digits[:13]) / 1000.0).strftime("%Y%m%d")
-            except Exception:
-                continue
-        if len(digits) >= 8:                       # YYYYMMDD, possibly with a time tail
-            return digits[:8]
+        if text.endswith(".0") and text[:-2].isdigit():
+            text = text[:-2]
+        compact = text.split(".", 1)[0]
+        # 日历日期先识别，避免 14 位日期时间和 ISO 字符串被误读为毫秒时间戳。
+        day = ""
+        if len(text) >= 10 and text[4] in "-/" and text[7] == text[4]:
+            day = text[:10].replace(text[4], "")
+        elif compact.isdigit() and len(compact) in (8, 14):
+            day = compact[:8]
+        try:
+            if day:
+                return _d.datetime.strptime(day, "%Y%m%d").strftime("%Y%m%d")
+            if text.isdigit() and len(text) in (10, 13):
+                seconds = int(text) / (1000.0 if len(text) == 13 else 1.0)
+                return _d.datetime.fromtimestamp(seconds).strftime("%Y%m%d")
+        except (ValueError, OverflowError, OSError):
+            continue
     return ""
 
 
 def _frame_rows(frame):
-    """A market-data frame as a list of row dicts, whatever shape it arrived in.
-
-    pandas DataFrame, this bridge's serialisable marker, a list of dicts, or a
-    dict of column arrays -- the same four shapes quote_utils deals with. No
-    pandas import: this also runs inside QMT's embedded Python.
-    """
+    """把帧、records 或列数组转为行字典；时间只在索引中时也保留该时间轴。"""
     if frame is None:
         return []
     if isinstance(frame, dict) and frame.get("__bigqmt_type__") == "DataFrame":
         return _frame_rows(frame.get("records") or [])
     if hasattr(frame, "columns") and hasattr(frame, "iloc"):
         try:
-            columns = list(frame.columns)
-            return [{name: frame[name][i] for name in columns}
-                    for i in range(len(frame))]
+            rows = frame.to_dict("records")
+            if not any(name in frame.columns for name in ("stime", "time", "date", "datetime", "timetag")):
+                for stamp, row in zip(frame.index, rows):
+                    row["stime"] = stamp
+            return rows
         except Exception:
             return []
     if isinstance(frame, (list, tuple)):

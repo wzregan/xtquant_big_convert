@@ -28,13 +28,15 @@ class OrderWatchTable(object):
     TTL_SECONDS = 86400.0
 
     def __init__(self):
+        """创建有界观察表；账户身份是所有委托索引的一部分。"""
         self._lock = threading.Lock()
-        self._by_remark = collections.OrderedDict()     # remark -> (ts, sysid)
-        self._status_by_sysid = collections.OrderedDict()  # sysid -> (ts, status)
+        self._by_remark = collections.OrderedDict()     # (账号, 备注) -> (时间, 系统号)
+        self._status_by_sysid = collections.OrderedDict()  # (账号, 系统号) -> (时间, 状态)
 
     def note(self, event):
-        """Learn one normalized order event. Never raises (callback thread)."""
+        """记录含 account_id 的归一化事件；缺账号时只写入匿名空间，不跨账号回退。"""
         try:
+            account_id = str(event.get("account_id") or "").strip()
             remark = str(event.get("user_order_id") or event.get("remark") or "").strip()
             sysid = str(event.get("order_sys_id") or "").strip()
             status = str(event.get("status") or "").strip()
@@ -43,11 +45,11 @@ class OrderWatchTable(object):
             now = time.time()
             with self._lock:
                 if remark:
-                    self._by_remark[remark] = (now, sysid)
-                    self._by_remark.move_to_end(remark)
+                    self._by_remark[(account_id, remark)] = (now, sysid)
+                    self._by_remark.move_to_end((account_id, remark))
                 if status:
-                    self._status_by_sysid[sysid] = (now, status)
-                    self._status_by_sysid.move_to_end(sysid)
+                    self._status_by_sysid[(account_id, sysid)] = (now, status)
+                    self._status_by_sysid.move_to_end((account_id, sysid))
                 while len(self._by_remark) > self.MAX_ENTRIES:
                     self._by_remark.popitem(last=False)
                 while len(self._status_by_sysid) > self.MAX_ENTRIES:
@@ -55,18 +57,19 @@ class OrderWatchTable(object):
         except Exception:
             pass
 
-    def sysid_for_remark(self, remark):
-        """The order_sys_id QMT assigned to this remark, or None."""
+    def sysid_for_remark(self, remark, account_id=""):
+        """按账号及备注读取系统号；account_id 为空仅查询旧式匿名事件。"""
         remark = str(remark or "").strip()
         if not remark:
             return None
+        key = (str(account_id or "").strip(), remark)
         with self._lock:
-            entry = self._by_remark.get(remark)
+            entry = self._by_remark.get(key)
             if entry is None:
                 return None
             ts, sysid = entry
             if time.time() - ts > self.TTL_SECONDS:
-                self._by_remark.pop(remark, None)
+                self._by_remark.pop(key, None)
                 return None
             return sysid
 
@@ -87,17 +90,18 @@ class OrderWatchTable(object):
                 "ttl_seconds": self.TTL_SECONDS,
             }
 
-    def status_for_sysid(self, order_sys_id):
-        """The latest status seen for this order_sys_id, or None."""
+    def status_for_sysid(self, order_sys_id, account_id=""):
+        """按账号及系统号读取状态；account_id 为空仅查询旧式匿名事件。"""
         sysid = str(order_sys_id or "").strip()
         if not sysid:
             return None
+        key = (str(account_id or "").strip(), sysid)
         with self._lock:
-            entry = self._status_by_sysid.get(sysid)
+            entry = self._status_by_sysid.get(key)
             if entry is None:
                 return None
             ts, status = entry
             if time.time() - ts > self.TTL_SECONDS:
-                self._status_by_sysid.pop(sysid, None)
+                self._status_by_sysid.pop(key, None)
                 return None
             return status

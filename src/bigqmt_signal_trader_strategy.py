@@ -1467,14 +1467,15 @@ _instrument_name_cache = {}     # stock_code -> name (only non-empty cached)
 
 
 def _presysid_key(event):
-    """Identity for pairing a sysid-less event with its sysid-bearing twin."""
+    """按账号配对系统号补齐前后的事件，备注和委托字段仅在账号内比较。"""
+    account_id = str(event.get("account_id") or "")
     remark = str(event.get("user_order_id") or event.get("remark") or "").strip()
     if remark:
-        return ("remark", remark)
+        return (account_id, "remark", remark)
     stock = str(event.get("stock_code") or "")
     if not stock:
         return None  # cannot key safely -- publish immediately
-    return ("fields", (
+    return (account_id, "fields", (
         stock, event.get("price"),
         event.get("volume") or event.get("order_volume"),
         event.get("direction"),
@@ -1506,7 +1507,7 @@ def _drop_held_presysid_twin(event):
 
 
 def _flush_held_presysid_orders(config):
-    """Publish held events whose window expired. Runs on the adjust tick."""
+    """在策略线程发布到期事件，发布账号沿用暂存事件中的原始身份。"""
     if not _held_presysid_orders:
         return
     event_config = dict(config.get("exec_events") or {})
@@ -1530,7 +1531,8 @@ def _flush_held_presysid_orders(config):
         if entry is None:
             continue
         event, _held_at, raw_obj = entry
-        _publish_one(exec_events, sink, account_id, event, "order", config)
+        event_account = str(event.get("account_id") or account_id)
+        _publish_one(exec_events, sink, event_account, event, "order", config)
         try:
             status = int(event.get("status") or 0)
         except (TypeError, ValueError):
@@ -1538,8 +1540,8 @@ def _flush_held_presysid_orders(config):
         if status == 57:
             # the held event turns out to be a junk: it still owes the
             # order_error twin the non-held path would have published.
-            _publish_one(exec_events, sink, account_id,
-                         exec_events.normalize_order_error_event(raw_obj, account_id),
+            _publish_one(exec_events, sink, event_account,
+                         exec_events.normalize_order_error_event(raw_obj, event_account),
                          "order_error", config)
 
 
@@ -1764,7 +1766,7 @@ def _enrich_event_identity(exec_events, config, account_id, event):
 
 
 def _publish_exec_event(kind, obj, context_info=None):
-    """Push a normalized order/trade event to Redis for real-time client callbacks."""
+    """按回调中的实际账号补齐身份并发布委托、成交事件；配置账号仅作缺失值回退。"""
     config = _build_config()
     event_config = dict(config.get("exec_events") or {})
     # Raw-field diagnostics run BEFORE every other check (and before the
@@ -1792,6 +1794,7 @@ def _publish_exec_event(kind, obj, context_info=None):
     try:
         if kind == "trade":
             event = exec_events.normalize_trade_event(obj, account_id)
+            account_id = str(event.get("account_id") or account_id)
             event = _enrich_event_identity(exec_events, config, account_id, event)
             if not event.get("instrument_name"):
                 event["instrument_name"] = _event_instrument_name(
@@ -1801,6 +1804,7 @@ def _publish_exec_event(kind, obj, context_info=None):
             _publish_one(exec_events, sink, account_id, event, kind, config)
         else:
             event = exec_events.normalize_order_event(obj, account_id)
+            account_id = str(event.get("account_id") or account_id)
             # Identity enrichment reads the remark->identity map that
             # remember_order_identity wrote. On a push channel the event goes
             # out un-enriched rather than not at all; order_sys_id and remark

@@ -1,0 +1,25 @@
+{
+  "upstream": "d07d4d5802a88babd33e54b37c2377a3fd734a86",
+  "reviewed_commits": 276,
+  "non_merge_commits": 212,
+  "merge_commits": 64,
+  "backup_branch": "backup/main-before-upstream-rebase-20260905-b0cdf9d",
+  "rebased_optimization_commit": "824921f",
+  "source_fingerprint_algorithm": "SHA256 of sorted tracked src Python path + NUL + bytes + NUL",
+  "source_sha256": "2f2c31675d88761c3c1ef2752533ea3183629e55f06e07031d022b619f5253e2",
+  "pytest": {
+    "passed": 1663,
+    "skipped": 1,
+    "subtests_passed": 3,
+    "seconds": 63.74,
+    "skip_reason": "optional pymongo bson not installed",
+    "command": "PYTHONPATH=/tmp/xtquant_big_convert_test_deps PYTHONDONTWRITEBYTECODE=1 python -m pytest tests -q -rs -p no:cacheprovider"
+  },
+  "python36_syntax_checked_changed_files": 15,
+  "live_qmt_tested": false,
+  "pushed": false,
+  "benchmark_results": [
+    "../benchmarks/results/20260905-upstream-0.3.22.json",
+    "../benchmarks/results/20260905-rebased.json"
+  ]
+}

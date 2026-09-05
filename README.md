@@ -10,7 +10,7 @@
 
 已发布 PyPI，客户端一行安装：`pip install xtquant-big-convert`（详见下文「环境要求与依赖安装」）。
 
-工作区的性能改进、离线对比结果及接口升级事项见 [2026-09-05 优化说明](docs/PERFORMANCE_OPTIMIZATION_20260905.md)。这些改动尚未发布到 PyPI。
+本分支已审阅并集成上游 0.3.22，保留本地优化；逐提交结论、修复和验证见 [2026-09-05 上游审阅记录](docs/UPSTREAM_REVIEW_20260905.md)。本地新增改动尚未发布到 PyPI。
 
 另附 [qmt-trader skill](qmt-trader/)：让 Claude Code / ZCode / Cursor 等 AI 助手通过统一 CLI（47 个子命令）直接查行情、算期权 Greeks、查持仓、下单撤单，详见下文「AI 助手 Skill：qmt-trader」。
 

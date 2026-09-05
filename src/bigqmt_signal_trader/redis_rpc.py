@@ -1775,7 +1775,7 @@ class BigQmtRpcHandlers:
         watch = getattr(self, "order_watch_table", None)
         if watch is not None:
             try:
-                watched_sysid = watch.sysid_for_remark(request.remark)
+                watched_sysid = watch.sysid_for_remark(request.remark, account_id=request.account_id)
             except Exception:
                 watched_sysid = None
             if watched_sysid:
@@ -2174,7 +2174,7 @@ class BigQmtRpcHandlers:
         return True
 
     def _apply_cancel_lookup(self, settlement, final=False):
-        """Resolve an ambiguous native cancel return from the order snapshot."""
+        """使用同账号的观察表或委托快照确认撤单，避免其他账号的同号状态串入。"""
         settlement.attempts += 1
         order_sys_id = str(settlement.order_ref.order_sys_id or "")
         # Fast path: the order's own status change was pushed to us by QMT's
@@ -2182,7 +2182,7 @@ class BigQmtRpcHandlers:
         watch = getattr(self, "order_watch_table", None)
         if watch is not None:
             try:
-                watched = watch.status_for_sysid(order_sys_id)
+                watched = watch.status_for_sysid(order_sys_id, account_id=settlement.account_id)
             except Exception:
                 watched = None
             if watched is not None:

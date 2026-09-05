@@ -1992,12 +1992,9 @@ class BigQmtXtData:
         return nested if nested else set(data.keys())
 
     def _heal_adjusted(self, method, params, data, wait_seconds=2.0, timeout_seconds=None):
-        """Self-heal reads served from an unready raw store: if the adjusted
-        pull came back all-zero, or a none-adjusted pull came back missing
-        most requested codes, trigger a server-side raw download, wait for
-        async landing, retry once."""
+        """复权数据全零或未复权数据缺码过半时补数，并在等待 wait_seconds 秒后重试一次。"""
         dividend_type = str(params.get("dividend_type") or "none").lower()
-        codes = list(params.get("stock_list") or params.get("stock_code") or [])
+        codes = list(dict.fromkeys(params.get("stock_list") or params.get("stock_code") or []))
         if not codes:
             return data
         if dividend_type in ("", "none"):
@@ -2014,7 +2011,7 @@ class BigQmtXtData:
             # missing: that is the raw-store-not-populated signal.
             served = self._served_codes(data)
             missing = sum(1 for code in codes if code not in served)
-            if missing < max(1, len(codes) // 2):
+            if missing * 2 <= len(codes):
                 return data
         elif not self._is_all_zero_any(data):
             return data
@@ -3158,11 +3155,7 @@ class BigQmtXtTrader:
                 pass
 
     def _dispatch_event(self, raw):
-        """Accepts raw bytes/str (Redis pub/sub) or an already-decoded dict.
-
-        The push channel decodes msgpack/json itself, so it hands over a dict --
-        str(dict) is not valid JSON and would be silently dropped here.
-        """
+        """接收 Redis 字节串或推送字典，按客户端账号过滤后分发；缺账号兼容旧协议。"""
         callback = self.callback
         if callback is None:
             return
@@ -3175,6 +3168,11 @@ class BigQmtXtTrader:
             except Exception:
                 return
         if not isinstance(event, dict):
+            return
+        event_account = str(event.get("account_id") or "").strip()
+        client_account = str(self.client.account_id or "").strip()
+        # ZMQ 执行主题由多个账号共用，过滤必须早于屏障、编号映射和用户回调。
+        if event_account and client_account and event_account != client_account:
             return
         # 放行超时的屏障, 再决定这条事件是直通还是暂存 (issue #51)。
         try:

@@ -58,8 +58,8 @@ class TableSemanticsTest(unittest.TestCase):
         table = OrderWatchTable()
         table.note({"user_order_id": "sig-1", "order_sys_id": "S1", "status": "50"})
         with table._lock:
-            table._by_remark["sig-1"] = (time.time() - 90000, "S1")
-            table._status_by_sysid["S1"] = (time.time() - 90000, "50")
+            table._by_remark[("", "sig-1")] = (time.time() - 90000, "S1")
+            table._status_by_sysid[("", "S1")] = (time.time() - 90000, "50")
         self.assertIsNone(table.sysid_for_remark("sig-1"))
         self.assertIsNone(table.status_for_sysid("S1"))
 
@@ -98,6 +98,7 @@ class SubmitFastPathTest(_Service):
         redis_client, service, handlers = self._service(gateway)
         handlers.order_watch_table = OrderWatchTable()
         handlers.order_watch_table.note({
+            "account_id": "acct",
             "user_order_id": "ord-1", "order_sys_id": "635076953", "status": "50"})
 
         service.enqueue_payload({
@@ -143,6 +144,7 @@ class CancelFastPathTest(_Service):
         redis_client, service, handlers = self._service(gateway)
         handlers.order_watch_table = OrderWatchTable()
         handlers.order_watch_table.note({
+            "account_id": "acct",
             "user_order_id": "x", "order_sys_id": "cancel-1", "status": "54"})
 
         self._cancel(service)
@@ -169,6 +171,7 @@ class CancelFastPathTest(_Service):
         redis_client, service, handlers = self._service(gateway)
         handlers.order_watch_table = OrderWatchTable()
         handlers.order_watch_table.note({
+            "account_id": "acct",
             "user_order_id": "x", "order_sys_id": "cancel-1", "status": "56"})
 
         self._cancel(service)
@@ -194,12 +197,12 @@ class StrategyWiringTest(unittest.TestCase):
         strategy._note_order_watch(obj)
         table = strategy._order_watch_table
         try:
-            self.assertEqual(table.sysid_for_remark("sig-9"), "635076953")
-            self.assertEqual(table.status_for_sysid("635076953"), "50")
+            self.assertEqual(table.sysid_for_remark("sig-9", account_id="acct"), "635076953")
+            self.assertEqual(table.status_for_sysid("635076953", account_id="acct"), "50")
         finally:
             with table._lock:
-                table._by_remark.pop("sig-9", None)
-                table._status_by_sysid.pop("635076953", None)
+                table._by_remark.pop(("acct", "sig-9"), None)
+                table._status_by_sysid.pop(("acct", "635076953"), None)
 
 
 if __name__ == "__main__":

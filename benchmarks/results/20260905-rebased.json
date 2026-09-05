@@ -1,0 +1,34 @@
+{
+  "python": "3.10.20",
+  "pandas": "2.3.3",
+  "source_dir": "/data/code/xtquant_big_convert/src",
+  "wire_format": "columns_v1",
+  "serialization": {
+    "symbols": 100,
+    "bars": 240,
+    "fields": 6,
+    "encode_ms": 41.84,
+    "decode_ms": 27.593,
+    "bytes": 1757637,
+    "frame_roundtrip_equal": true
+  },
+  "cache": {
+    "rows": 20000,
+    "format": "parquet",
+    "hot_read_last_row_ms": 0.036,
+    "unchanged_last_row_write_ms": 3.024,
+    "changed_last_row_write_ms": 10.111
+  },
+  "idle_20_ticks": {
+    "positions": 1,
+    "asset": 1,
+    "publish": 1
+  },
+  "settlement_20_orders": {
+    "full_order_queries_per_drain": 1
+  },
+  "async_rpc_delay_50ms": {
+    "query_caller_ms": 0.025,
+    "cancel_caller_ms": 0.022
+  }
+}
