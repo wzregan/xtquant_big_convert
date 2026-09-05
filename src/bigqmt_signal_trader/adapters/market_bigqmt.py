@@ -479,6 +479,7 @@ class BigQmtMarketDataProvider:
         raise NotImplementedError("none of the ContextInfo methods is available")
 
     def _market_data_shapes(self, method_name, **params):
+        """生成不同 QMT 版本的调用形式，所有候选都保留是否填充缺失数据的语义。"""
         field_list = list(params.get("field_list") or params.get("fields") or [])
         stock_list = _as_list(params.get("stock_list") or params.get("stock_code"))
         period = params.get("period", "1d")
@@ -508,6 +509,11 @@ class BigQmtMarketDataProvider:
             "count": count,
             "dividend_type": dividend_type,
         }
+        if method_name == "get_market_data":
+            # 旧版大 QMT 使用 skip_paused 表达是否填充停牌数据。
+            big_kwargs["skip_paused"] = fill_data
+        else:
+            big_kwargs["fill_data"] = fill_data
         if method_name == "get_local_data" and data_dir is not None:
             mini_kwargs["data_dir"] = data_dir
             big_kwargs["data_dir"] = data_dir
@@ -517,27 +523,12 @@ class BigQmtMarketDataProvider:
             "end_time": end_time,
             "count": count,
             "dividend_type": dividend_type,
+            "fill_data": fill_data,
         }
         if method_name == "get_local_data" and data_dir is not None:
             positional_tail_kwargs["data_dir"] = data_dir
 
-        # fill_data (停牌填充) reaches big QMT too. Its signature has it --
-        #   C.get_market_data_ex(fields, stock_code, period, start_time,
-        #                        end_time, count, dividend_type, fill_data,
-        #                        subscribe)
-        # -- and big_kwargs is the FIRST shape tried, so it succeeded while
-        # silently dropping the argument: a caller asking not to fill suspended
-        # days got them filled anyway, with no error (issue #167, @zxm9999).
-        #
-        # Carried in a shape of its own, tried ahead of the bare one, rather
-        # than added to big_kwargs directly: a terminal whose signature lacks
-        # fill_data would raise TypeError, and _call_first_supported only falls
-        # through on TypeError -- so the bare shape has to stay reachable.
-        big_kwargs_filled = dict(big_kwargs, fill_data=fill_data)
-        positional_tail_filled = dict(positional_tail_kwargs, fill_data=fill_data)
-
-        return [
-            (method_name, (), big_kwargs_filled),
+        shapes = [
             (method_name, (), big_kwargs),
             (method_name, (), mini_kwargs),
             (
@@ -545,7 +536,6 @@ class BigQmtMarketDataProvider:
                 (field_list, stock_list, period, start_time, end_time, count, dividend_type, fill_data),
                 {},
             ),
-            (method_name, (field_list, stock_list), positional_tail_filled),
             (method_name, (field_list, stock_list), positional_tail_kwargs),
             (
                 method_name,
@@ -557,6 +547,7 @@ class BigQmtMarketDataProvider:
                     "end_time": end_time,
                     "count": count,
                     "dividend_type": dividend_type,
+                    "fill_data": fill_data,
                 },
             ),
             (
@@ -573,6 +564,12 @@ class BigQmtMarketDataProvider:
                 },
             ),
         ]
+        if fill_data:
+            # 旧版 ori 接口不接收 fill_data，只有请求默认填充时才能安全省略。
+            shapes.append((method_name, (), {
+                key: value for key, value in big_kwargs.items() if key != "fill_data"
+            }))
+        return shapes
 
     def _sector_codes(self, sector):
         """Cached sector listing. Membership does not change intraday and the
@@ -696,7 +693,8 @@ class BigQmtMarketDataProvider:
                     period="tick",
                     count=1,
                     dividend_type="none",
-                    fill_data=False,
+                    # 此处读取最新可用 tick，沿用终端默认形态以兼容旧 ori 签名。
+                    fill_data=True,
                 ) or {}
                 for code in missing_options:
                     row = latest_quote_row(find_code_payload(fallback, code))
@@ -787,16 +785,22 @@ class BigQmtMarketDataProvider:
         )
 
     def get_market_data_ex(self, **kwargs):
+        """优先使用原始数组接口；旧版原始接口不支持显式填充参数时转用标准接口。"""
         raw_method = getattr(self.context_info, "get_market_data_ex_ori", None)
         if callable(raw_method):
-            raw_data = self._call_first_supported(
-                self._market_data_shapes("get_market_data_ex_ori", **kwargs)
-            )
-            return _raw_market_data_payload(
-                raw_data,
-                kwargs.get("field_list") or kwargs.get("fields"),
-                kwargs.get("stock_list") or kwargs.get("stock_code"),
-            )
+            try:
+                raw_data = self._call_first_supported(
+                    self._market_data_shapes("get_market_data_ex_ori", **kwargs)
+                )
+            except TypeError:
+                if kwargs.get("fill_data", True):
+                    raise
+            else:
+                return _raw_market_data_payload(
+                    raw_data,
+                    kwargs.get("field_list") or kwargs.get("fields"),
+                    kwargs.get("stock_list") or kwargs.get("stock_code"),
+                )
         shapes = self._market_data_shapes("get_market_data_ex", **kwargs)
         if hasattr(self.context_info, "get_market_data"):
             shapes.extend(self._market_data_shapes("get_market_data", **kwargs))

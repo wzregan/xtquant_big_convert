@@ -9,6 +9,9 @@ back to pickle when pyarrow is unavailable. A cache written in one format is rea
 """
 
 import os
+import tempfile
+import threading
+from collections import OrderedDict
 
 
 # Candidate time-column names produced by the RPC market-data path.
@@ -100,9 +103,80 @@ def _resolve_format(fmt):
 
 
 class LocalMarketCache:
-    def __init__(self, cache_dir=None, fmt="auto"):
+    def __init__(self, cache_dir=None, fmt="auto", memory_max_bytes=64 * 1024 * 1024, memory_max_entries=32):
+        """创建本地缓存；内存上限按字节和文件数限制，任一设为 0 即禁用内存缓存。"""
         self.cache_dir = str(cache_dir or os.path.join(os.path.expanduser("~"), ".bigqmt_cache"))
         self.fmt = _resolve_format(fmt)
+        self.memory_max_bytes = max(0, int(memory_max_bytes))
+        self.memory_max_entries = max(0, int(memory_max_entries))
+        self._frames = OrderedDict()
+        self._memory_bytes = 0
+        # 同一实例的读、合并、替换串行化，避免下载线程覆盖彼此的增量。
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _signature(path):
+        """用文件身份、大小及修改时间识别其他进程替换后的缓存。"""
+        stat = os.stat(path)
+        return (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+    def _forget(self, path):
+        """移除内存副本，并归还其计入的容量。"""
+        entry = self._frames.pop(path, None)
+        if entry is not None:
+            self._memory_bytes -= entry[2]
+
+    def _remember(self, path, signature, frame):
+        """保存实例独占的帧；调用方不可再修改该对象。"""
+        self._forget(path)
+        if not self.memory_max_bytes or not self.memory_max_entries:
+            return
+        size = int(frame.memory_usage(index=True, deep=True).sum())
+        if size > self.memory_max_bytes:
+            return
+        while self._frames and (
+            len(self._frames) >= self.memory_max_entries
+            or self._memory_bytes + size > self.memory_max_bytes
+        ):
+            self._forget(next(iter(self._frames)))
+        self._frames[path] = (signature, frame, size)
+        self._memory_bytes += size
+
+    def _read_cached(self, path):
+        """返回内部只读帧；文件变化时失效，读取中被替换则不缓存本次结果。"""
+        signature = self._signature(path)
+        entry = self._frames.get(path)
+        if entry is not None and entry[0] == signature:
+            self._frames.move_to_end(path)
+            return entry[1]
+        self._forget(path)
+        frame = self._read_file(path)
+        if self._signature(path) == signature:
+            self._remember(path, signature, frame)
+        return frame
+
+    @staticmethod
+    def _merge_frames(old, incoming):
+        """按时间及本次提供的字段更新；显式空值覆盖旧值，缺席字段保留旧值。"""
+        import pandas as pd
+
+        axis, on_index = _time_axis(incoming)
+        old_axis, old_on_index = _time_axis(old)
+        if not axis:
+            return pd.concat([old, incoming], ignore_index=True, sort=False)
+        if not old_axis:
+            # 无时间轴的旧缓存无法可靠关联，沿用原有的重建行为。
+            return incoming
+        left = old if old_on_index else old.set_index(old_axis)
+        right = incoming if on_index else incoming.set_index(axis)
+        left = left[~left.index.duplicated(keep="last")]
+        right = right[~right.index.duplicated(keep="last")]
+        new_rows = right.loc[~right.index.isin(left.index)]
+        merged = pd.concat([left, new_rows], sort=False)
+        # 不使用 update/combine_first：它们跳过 NaN，无法清除已失效的值。
+        merged.loc[right.index, right.columns] = right
+        merged.index.name = right.index.name
+        return merged if on_index else merged.reset_index()
 
     def _ext(self):
         return ".parquet" if self.fmt == "parquet" else ".pkl"
@@ -145,16 +219,14 @@ class LocalMarketCache:
             df.to_pickle(path)
 
     def write(self, code, period, df, dividend_type="none"):
-        """Merge ``df`` into the cache for (code, period, dividend_type).
+        """合并行情并返回总行数；只更新 df 提供的字段，不修改调用方持有的帧。"""
+        with self._lock:
+            return self._write(code, period, df, dividend_type)
 
-        Dedupe is by time keeping the LAST write, so re-pulling a range overwrites
-        stale values — which is exactly what front-adjusted (前复权) data needs after
-        a new dividend re-scales history. Returns total rows stored.
-        """
+    def _write(self, code, period, df, dividend_type):
+        """持锁合并、原子替换文件，并同步刷新内存副本。"""
         if df is None or not hasattr(df, "shape") or df.shape[0] == 0:
             return 0
-        import pandas as pd
-
         incoming = _drop_placeholder_rows(df.copy())
         primary = self.path(code, period, dividend_type)
         existing = self._existing_path(code, period, dividend_type)
@@ -162,7 +234,7 @@ class LocalMarketCache:
             # Nothing real to add (all 0-fill placeholders); keep existing cache.
             if existing:
                 try:
-                    return self._read_file(existing).shape[0]
+                    return self._read_cached(existing).shape[0]
                 except Exception:
                     return 0
             return 0
@@ -170,22 +242,14 @@ class LocalMarketCache:
         if directory and not os.path.isdir(directory):
             os.makedirs(directory, exist_ok=True)
         merged = incoming
-        _, incoming_on_index = _time_axis(incoming)
+        old = None
         if existing:
             try:
-                old = self._read_file(existing)
-                _, old_on_index = _time_axis(old)
-                if incoming_on_index and old_on_index:
-                    # 保留时间索引（ignore_index=True 会把 MiniQMT 形态的时间轴丢掉）。
-                    merged = pd.concat([old, merged])
-                elif incoming_on_index and not old_on_index:
-                    # 老缓存无时间轴（旧版写出），行不可切片、合并还会毁掉新数据
-                    # 的时间索引。老行丢弃——cache-through 每次都会重拉完整窗口。
-                    merged = incoming
-                else:
-                    merged = pd.concat([old, merged], ignore_index=True)
+                old = self._read_cached(existing)
             except Exception:
                 pass
+            if old is not None:
+                merged = self._merge_frames(old, incoming)
         axis, on_index = _time_axis(merged)
         if on_index:
             merged = merged[~merged.index.duplicated(keep="last")].sort_index()
@@ -193,12 +257,22 @@ class LocalMarketCache:
             merged = merged.drop_duplicates(subset=[axis], keep="last").sort_values(axis).reset_index(drop=True)
         else:
             merged = merged.drop_duplicates().reset_index(drop=True)
-        # Atomic-ish write (temp + replace) so a crash mid-write can't corrupt the file.
-        tmp = primary + ".tmp"
-        self._write_file(merged, tmp)
-        os.replace(tmp, primary)
+        if existing == primary and old is not None and merged.equals(old):
+            return merged.shape[0]
+        # 临时文件名唯一，其他缓存实例写入时也不会读到半个文件。
+        fd, tmp = tempfile.mkstemp(prefix=".bigqmt-", suffix=".tmp", dir=directory)
+        os.close(fd)
+        try:
+            self._write_file(merged, tmp)
+            signature = self._signature(tmp)
+            os.replace(tmp, primary)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        self._remember(primary, signature, merged)
         # Migrated from the other format? drop the stale file.
         if existing and existing != primary:
+            self._forget(existing)
             try:
                 os.remove(existing)
             except Exception:
@@ -206,12 +280,17 @@ class LocalMarketCache:
         return merged.shape[0]
 
     def read(self, code, period, start_time="", end_time="", count=-1, dividend_type="none"):
-        """Return the cached DataFrame for (code, period, dividend_type), filtered."""
+        """按日期范围及末尾 count 行读取；返回独立副本，调用方修改不污染缓存。"""
+        with self._lock:
+            return self._read(code, period, start_time, end_time, count, dividend_type)
+
+    def _read(self, code, period, start_time, end_time, count, dividend_type):
+        """持锁复用内存帧，先切片再复制，避免为少量尾部数据复制整个历史。"""
         existing = self._existing_path(code, period, dividend_type)
         if not existing:
             return None
         try:
-            df = self._read_file(existing)
+            df = self._read_cached(existing)
         except Exception:
             return None
         axis, on_index = _time_axis(df)
@@ -226,7 +305,11 @@ class LocalMarketCache:
                 series = df.index.astype(str) if on_index else df[axis].astype(str)
                 df = df[series <= _pad_end(end_time)]
             # 索引形态保留时间索引（MiniQMT 形态），列形态维持原 reset 行为。
-            df = df.sort_index() if on_index else df.sort_values(axis).reset_index(drop=True)
+            if on_index:
+                if not df.index.is_monotonic_increasing:
+                    df = df.sort_index()
+            elif not df[axis].is_monotonic_increasing:
+                df = df.sort_values(axis)
         try:
             n = int(count)
         except (TypeError, ValueError):
@@ -234,7 +317,9 @@ class LocalMarketCache:
         if n > 0 and df.shape[0] > n:
             # 索引形态保留时间索引；列形态维持原 reset 行为。
             df = df.tail(n) if _time_axis(df)[1] else df.tail(n).reset_index(drop=True)
-        return df
+        if axis and not on_index:
+            return df.reset_index(drop=True)
+        return df.copy()
 
     def covered(self, code, period, dividend_type="none"):
         """Return (first_time, last_time, rows) for the cache, or None if empty."""

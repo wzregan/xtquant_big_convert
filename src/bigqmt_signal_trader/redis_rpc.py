@@ -159,6 +159,8 @@ LISTENER_DEFERRED_METHODS = {
     "get_value_by_order_id",
     "get_last_order_id",
     "get_history_trade_detail_data",
+    # 申购额度依赖交易账户上下文，不能在行情监听线程中查询。
+    "get_new_purchase_limit",
 }
 
 # Trade-context queries route through QMT's get_trade_detail_data, which
@@ -343,54 +345,47 @@ def _is_redis_timeout(exc):
     return ("redis" in module and "timeout" in name) or "timeout reading from socket" in text
 
 
-def to_jsonable(value):
-    # Fast path for the shapes that dominate a market payload. A whole-market
-    # snapshot is 1.9M nodes, and every one of them used to walk the full
-    # type-probing chain below -- starting with a getattr(value, "item") that
-    # misses on every plain float. Measured on 51285 instruments: 628.7ms ->
-    # 328.0ms, byte-identical output.
-    #
-    # Checked by exact type, not isinstance, on purpose: numpy's float64 is a
-    # subclass of float, so identity checks let it fall through to the full
-    # path where _maybe_scalar still unwraps it. Being fast here must not
-    # change what anything serialises to.
+def to_jsonable(value, dataframe_format="records"):
+    """递归转换 RPC 结果；只有已声明能力的客户端才使用按列编码。"""
+    # 原生标量走精确类型快路；NumPy 标量继续解包，递归时传递帧格式。
     kind = type(value)
     if kind is float:
         return None if (math.isnan(value) or math.isinf(value)) else value
     if kind is int or kind is str or kind is bool or value is None:
         return value
     if kind is dict:
-        return {str(key): to_jsonable(item) for key, item in value.items()}
+        return {str(key): to_jsonable(item, dataframe_format) for key, item in value.items()}
     if kind is list:
-        return [to_jsonable(item) for item in value]
+        return [to_jsonable(item, dataframe_format) for item in value]
 
     value = _maybe_scalar(value)
     if value is None or isinstance(value, (str, int, float, bool)):
         if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
             return None
         return value
-    if isinstance(value, (_dt.datetime, _dt.date)):
-        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if value.__class__.__module__.startswith("pandas") and value.__class__.__name__ in ("NAType", "NaTType"):
+        return None
     if hasattr(value, "isoformat") and value.__class__.__module__.startswith("pandas"):
         try:
             return value.isoformat()
         except Exception:
             return str(value)
+    if isinstance(value, (_dt.datetime, _dt.date)):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
     if hasattr(value, "to_dict") and hasattr(value, "columns") and hasattr(value, "index"):
         try:
-            frame = value.reset_index()
-            return {
-                "__bigqmt_type__": "DataFrame",
-                "columns": [str(col) for col in frame.columns],
-                "records": to_jsonable(frame.to_dict("records")),
-            }
+            from .dataframe_wire import encode_frame
+
+            return encode_frame(
+                value, lambda item: to_jsonable(item, dataframe_format), dataframe_format,
+            )
         except Exception:
             return str(value)
     if hasattr(value, "to_dict") and hasattr(value, "index") and not isinstance(value, dict):
         try:
             return {
                 "__bigqmt_type__": "Series",
-                "data": to_jsonable(value.to_dict()),
+                "data": to_jsonable(value.to_dict(), dataframe_format),
             }
         except Exception:
             return str(value)
@@ -413,25 +408,25 @@ def to_jsonable(value):
                 "items": labels,
                 "major_axis": [str(item) for item in value.major_axis],
                 "minor_axis": [str(item) for item in value.minor_axis],
-                "data": {str(item): to_jsonable(value[item]) for item in value.items},
+                "data": {str(item): to_jsonable(value[item], dataframe_format) for item in value.items},
             }
         except Exception:
             return str(value)
     if hasattr(value, "tolist") and not isinstance(value, (str, bytes, bytearray)):
         try:
-            return to_jsonable(value.tolist())
+            return to_jsonable(value.tolist(), dataframe_format)
         except Exception:
             pass
     if isinstance(value, dict):
-        return {str(key): to_jsonable(item) for key, item in value.items()}
+        return {str(key): to_jsonable(item, dataframe_format) for key, item in value.items()}
     if isinstance(value, (list, tuple, set)):
-        return [to_jsonable(item) for item in value]
+        return [to_jsonable(item, dataframe_format) for item in value]
     enum_value = getattr(value, "value", None)
     if isinstance(enum_value, (str, int, float, bool)):
         return enum_value
     if hasattr(value, "__dict__"):
         return {
-            key: to_jsonable(item)
+            key: to_jsonable(item, dataframe_format)
             for key, item in vars(value).items()
             if not key.startswith("_")
         }
@@ -1760,11 +1755,18 @@ class BigQmtRpcHandlers:
         self._pending_settlement = None
         return settlement
 
-    def _apply_order_lookup(self, settlement, final=False, inline=False):
-        """Look the order up by remark. True when settled, False to retry.
+    def _orders_by_remark(self, account_id):
+        """在策略线程读取一次账户委托，按备注建索引，重复备注沿用首条匹配。"""
+        result = {}
+        for order in self.order_gateway.query_orders(account_id, "") or []:
+            remark = str(getattr(order, "user_order_id", "") or "").strip()
+            result.setdefault(remark, order)
+        return result
 
-        MUST run on the main strategy thread -- get_trade_detail_data returns
-        empty anywhere else.
+    def _apply_order_lookup(self, settlement, final=False, inline=False, orders_by_remark=None):
+        """按备注确认委托；传入本轮索引可复用查询，返回 False 表示下轮重试。
+
+        必须在策略线程执行。orders_by_remark 不跨轮缓存，避免提交后读取旧快照。
         """
         request = settlement.order_request
         settlement.attempts += 1
@@ -1783,13 +1785,15 @@ class BigQmtRpcHandlers:
                     pass
                 return True
         try:
-            orders = self.order_gateway.query_orders(request.account_id, "") or []
-            by_remark = [
-                o for o in orders
-                if str(getattr(o, "user_order_id", "") or "").strip() == request.remark.strip()
-            ]
-            if by_remark:
-                sysid = str(getattr(by_remark[0], "order_sys_id", "") or "")
+            if callable(orders_by_remark):
+                orders_by_remark = orders_by_remark(request.account_id)
+            if isinstance(orders_by_remark, Exception):
+                raise orders_by_remark
+            if orders_by_remark is None:
+                orders_by_remark = self._orders_by_remark(request.account_id)
+            order = orders_by_remark.get(request.remark.strip())
+            if order is not None:
+                sysid = str(getattr(order, "order_sys_id", "") or "")
                 if sysid:
                     try:
                         settlement.result.order_sys_id = sysid
@@ -1852,8 +1856,11 @@ class BigQmtRpcHandlers:
             if inline:
                 self._last_server_error = message
             return True
-        except Exception:
-            # A failed lookup must not lose the order -- it is already submitted.
+        except Exception as exc:
+            # 委托已提交，查单失败不能重发；把未能确认的原因返回给调用方。
+            settlement.server_error = "order lookup failed after submission: %s" % exc
+            if inline:
+                self._last_server_error = settlement.server_error
             return True
 
     def _handle_submit_orders_batch(self, params):
@@ -2594,20 +2601,23 @@ class RedisPubSubRpcService:
         return payload
 
     def settle_pending_orders(self, max_items=100):
-        """Retry parked submit/cancel lookups on the adjust thread.
-
-        A queue rather than a list because rpc_listener_methods is configurable:
-        if submit_order is ever put in it, the producer becomes the listener
-        thread while this consumer stays on adjust.
-
-        Unsettled entries go back on the queue, so each order costs one lookup
-        per adjust tick until it resolves or its deadline passes.
-        """
+        """在策略线程批量确认委托，每个账户本轮只读取一次完整委托列表。"""
         settled = 0
         # Snapshot the size first. Unsettled entries go back on the same queue,
         # so draining until empty would keep re-picking them and spin one adjust
         # tick into many lookups per order.
         batch = min(int(max_items), self._pending_settlements.qsize())
+        account_orders = {}
+
+        def orders_for_account(account_id):
+            """观察表未命中时才查单，同账户的结果或异常只获取一次。"""
+            if account_id not in account_orders:
+                try:
+                    account_orders[account_id] = self.handlers._orders_by_remark(account_id)
+                except Exception as exc:
+                    account_orders[account_id] = exc
+            return account_orders[account_id]
+
         for _ in range(batch):
             try:
                 settlement = self._pending_settlements.get_nowait()
@@ -2618,7 +2628,9 @@ class RedisPubSubRpcService:
                 if isinstance(settlement, CancelSettlement):
                     done = self.handlers._apply_cancel_lookup(settlement, final=expired)
                 else:
-                    done = self.handlers._apply_order_lookup(settlement, final=expired)
+                    done = self.handlers._apply_order_lookup(
+                        settlement, final=expired, orders_by_remark=orders_for_account,
+                    )
             except Exception:
                 done = True  # never strand a submitted order in the queue
             if not done:
@@ -2641,8 +2653,7 @@ class RedisPubSubRpcService:
         return self._pending_settlements.qsize()
 
     def drain_pending(self, max_items=20):
-        # Settle carry-overs from earlier ticks before taking on new work.
-        self.settle_pending_orders()
+        """处理有界请求批次后统一查单，使新旧待确认委托共享本轮快照。"""
         processed = 0
         for _ in range(int(max_items)):
             try:
@@ -2656,9 +2667,7 @@ class RedisPubSubRpcService:
                 )
             self.process_request(request)
             processed += 1
-        # Settle again so an order submitted in THIS drain still replies on this
-        # tick. One lookup, no sleep -- if QMT has not assigned the id yet we
-        # simply retry next tick rather than holding the thread (issue #44).
+        # 提交全部完成后再获取快照；新委托仍可当轮返回，未确认项下轮再查。
         self.settle_pending_orders()
         return processed
 
@@ -2709,7 +2718,7 @@ class RedisPubSubRpcService:
             _t0 = time.perf_counter() if method == "ping" else 0.0
             result = self.handlers.handle(method, request.get("params") or {})
             _t1 = time.perf_counter() if method == "ping" else 0.0
-            response["data"] = to_jsonable(result)
+            response["data"] = to_jsonable(result, request.get("dataframe_format", "records"))
             response["ok"] = True
             # Surface server-side diagnostics when the handler recorded one.
             server_error = getattr(self.handlers, "_last_server_error", None)
@@ -2846,8 +2855,9 @@ def call_redis_rpc(
     timeout_seconds=3.0,
     ttl_seconds=60,
     transport="queue",
+    dataframe_format="records",
 ):
-    """Small external client helper for tests and admin scripts."""
+    """发送 Redis RPC；dataframe_format 声明客户端可解码的帧格式，默认兼容 records。"""
 
     request_id = uuid.uuid4().hex
     request_channel = request_channel_template.format(account_id=account_id)
@@ -2865,6 +2875,7 @@ def call_redis_rpc(
         "reply_list": response_list,
         "reply_key": response_key,
         "ttl_seconds": ttl_seconds,
+        "dataframe_format": dataframe_format,
     }
     payload = encode_rpc_request_payload(request)
     if str(transport or "queue").lower() in ("queue", "list", "blpop"):

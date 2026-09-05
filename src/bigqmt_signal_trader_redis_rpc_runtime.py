@@ -129,6 +129,8 @@ SCHEDULE_ADJUST_ENABLED = True
 # queue wait for read RPCs. Verify on the live box that run_time honors sub-3s
 # intervals (see the adjust cadence log) before trusting a low value.
 SCHEDULE_ADJUST_INTERVAL = "500nMilliSecond"
+# 账户快照的兜底刷新间隔（秒）；0 可恢复每轮刷新。
+POSITION_SYNC_INTERVAL_SECONDS = 3.0
 FULL_TICK_CACHE_ENABLED = False
 FULL_TICK_DEMAND_TTL_SECONDS = 10
 FULL_TICK_CACHE_TTL_SECONDS = 10
@@ -268,6 +270,9 @@ SCHEDULE_ADJUST_ENABLED = bool(BIGQMT_REDIS_CONFIG.get("schedule_adjust", SCHEDU
 if not RPC_BACKGROUND_THREADS:
     SCHEDULE_ADJUST_ENABLED = True
 SCHEDULE_ADJUST_INTERVAL = str(BIGQMT_REDIS_CONFIG.get("schedule_adjust_interval", SCHEDULE_ADJUST_INTERVAL))
+POSITION_SYNC_INTERVAL_SECONDS = max(0.0, float(
+    BIGQMT_REDIS_CONFIG.get("position_sync_interval_seconds", POSITION_SYNC_INTERVAL_SECONDS)
+))
 FULL_TICK_CACHE_ENABLED = bool(BIGQMT_REDIS_CONFIG.get("full_tick_cache_enabled", FULL_TICK_CACHE_ENABLED))
 FULL_TICK_DEMAND_TTL_SECONDS = float(
     BIGQMT_REDIS_CONFIG.get("full_tick_demand_ttl_seconds", FULL_TICK_DEMAND_TTL_SECONDS)
@@ -359,6 +364,8 @@ def _apply_config(account_id):
         account_id=account_id,
         account_type=ACCOUNT_TYPE,
         position_sync_type="redis" if RPC_TRANSPORT in ("redis", "", "default") else "",
+        # 纯 RPC 模式无需每个 100/500 毫秒调度都查资产和持仓；成交回报仍立即同步。
+        position_sync_interval_seconds=POSITION_SYNC_INTERVAL_SECONDS,
         enable_rpc=True,
         schedule_adjust=SCHEDULE_ADJUST_ENABLED,
         schedule_adjust_interval=SCHEDULE_ADJUST_INTERVAL,

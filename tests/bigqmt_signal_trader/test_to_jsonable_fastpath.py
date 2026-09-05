@@ -150,7 +150,7 @@ class ExactTypeGuardTest(unittest.TestCase):
         path = os.path.join(ROOT, "src", "bigqmt_signal_trader", "redis_rpc.py")
         with io.open(path, encoding="utf-8") as handle:
             source = handle.read()
-        start = source.index("def to_jsonable(value):")
+        start = source.index("def to_jsonable(value")
         body = source[start:start + 1400]
 
         self.assertIn("kind = type(value)", body)

@@ -282,6 +282,7 @@ BIGQMT_REDIS_CONFIG = {
     # (issues #145 / #147).
     "redis_enabled": False,
     "rpc_allow_order_methods": False,
+    "position_sync_interval_seconds": 3.0,
     # Requests drain through QMT's run_time("adjust", ...) callback, on the main
     # strategy thread. get_trade_detail_data returns EMPTY off that thread, so
     # order/query methods must not be moved to a background thread.

@@ -513,6 +513,9 @@ SERVED_FIELDS = frozenset((
 
 
 def _market_data_params(params):
+    """翻译历史行情参数；未验证的填充语义交给策略 RPC 处理。"""
+    if not params.get("fill_data", True):
+        raise ValueError("fill_data=False is not supported by the FormulaServer route")
     fields = _as_list(_first(params, ("field_list", "fields"), None))
     codes = _as_list(_first(params, ("stock_list", "stock_code", "stockCodes"), None))
     if not fields or not codes:

@@ -819,15 +819,18 @@ class ExecEventsClientDispatchTest(unittest.TestCase):
                          sorted(r.seq for r in cb.async_responses))
 
     def test_cancel_order_stock_async_fires_response(self):
+        """等待后台撤单完成，再验证异步响应中的序号和成功状态。"""
         trader, cb = self._trader()
         original = trader.cancel_order_stock_sysid
 
         def fake_cancel(account, market, sysid):
-            return 0        # MiniQMT: 0 == success (issue #113)
+            """模拟 MiniQMT 撤单成功码。"""
+            return 0
 
         trader.cancel_order_stock_sysid = fake_cancel
         try:
             seq = trader.cancel_order_stock_sysid_async("acct", "SH", "sys-1")
+            self.assertTrue(trader.wait_async_requests(timeout=5.0))
         finally:
             trader.cancel_order_stock_sysid = original
 

@@ -109,12 +109,13 @@ class ItReachesBigQmtTest(unittest.TestCase):
         self.assertEqual(kwargs["stock_code"], ["600000.SH"])
 
     def test_get_market_data_carries_it_too(self):
+        """旧版 get_market_data 通过 skip_paused 接收填充开关。"""
         context = Recorder()
         _provider(context).get_market_data(
             field_list=[], stock_list=["600000.SH"], period="1d",
             fill_data=False)
 
-        self.assertFalse(context.calls[0]["kwargs"]["fill_data"])
+        self.assertFalse(context.calls[0]["kwargs"]["skip_paused"])
 
     def test_get_local_data_carries_it_too(self):
         context = Recorder()
@@ -128,32 +129,33 @@ class ItReachesBigQmtTest(unittest.TestCase):
 class OlderTerminalStillWorksTest(unittest.TestCase):
     """A terminal whose signature lacks fill_data must not start failing."""
 
-    def test_it_falls_back_to_the_bare_shape(self):
-        context = Recorder(reject={"fill_data"})
+    def test_default_fill_falls_back_to_the_bare_shape(self):
+        """没有填充参数的旧终端仅在请求默认填充时允许降级。"""
+        class LegacyContext:
+            def get_market_data_ex(self, fields, stock_code, period, start_time,
+                                   end_time, count, dividend_type):
+                """模拟固定旧签名并返回实际收到的参数。"""
+                return dict(fields=fields, stock_code=stock_code, period=period,
+                            start_time=start_time, end_time=end_time, count=count,
+                            dividend_type=dividend_type)
 
-        result = _provider(context).get_market_data_ex(
-            field_list=[], stock_list=["600000.SH"], period="1d",
-            fill_data=False)
-
-        self.assertTrue(result, "the call must still succeed")
-        self.assertEqual(context.calls[0]["rejected"], ["fill_data"])
-        self.assertNotIn("fill_data", context.calls[1]["kwargs"])
-
-    def test_the_fallback_keeps_every_other_argument(self):
-        context = Recorder(reject={"fill_data"})
-
-        _provider(context).get_market_data_ex(
+        provider = _provider(LegacyContext())
+        result = provider.get_market_data_ex(
             field_list=["close"], stock_list=["600000.SH"], period="1d",
             start_time="20260101", end_time="20260201", count=5,
-            dividend_type="front", fill_data=False)
+            dividend_type="front", fill_data=True)
+        self.assertEqual(result, dict(fields=["close"], stock_code=["600000.SH"],
+                                     period="1d", start_time="20260101",
+                                     end_time="20260201", count=5, dividend_type="front"))
+        with self.assertRaises(TypeError):
+            provider.get_market_data_ex(stock_list=["600000.SH"], fill_data=False)
 
-        kwargs = context.calls[1]["kwargs"]
-        self.assertEqual(kwargs["fields"], ["close"])
-        self.assertEqual(kwargs["period"], "1d")
-        self.assertEqual(kwargs["start_time"], "20260101")
-        self.assertEqual(kwargs["end_time"], "20260201")
-        self.assertEqual(kwargs["count"], 5)
-        self.assertEqual(kwargs["dividend_type"], "front")
+    def test_false_is_never_dropped_by_a_candidate(self):
+        """显式不填充时，每个候选均通过命名参数或第八个位置参数携带 False。"""
+        shapes = _provider(Recorder())._market_data_shapes(
+            "get_market_data_ex", stock_list=["600000.SH"], fill_data=False)
+        for _, args, kwargs in shapes:
+            self.assertIs(kwargs.get("fill_data", args[7] if len(args) > 7 else None), False)
 
     def test_a_terminal_rejecting_the_big_names_still_reaches_a_shape(self):
         """The whole point of the shape list -- do not narrow it."""
@@ -169,10 +171,11 @@ class OlderTerminalStillWorksTest(unittest.TestCase):
 
 class ShapeOrderTest(unittest.TestCase):
     def test_every_filled_shape_precedes_its_bare_twin(self):
+        """默认填充时，显式参数候选先于旧版无参数候选。"""
         provider = _provider(Recorder())
         shapes = provider._market_data_shapes(
             "get_market_data_ex", field_list=[], stock_list=["600000.SH"],
-            fill_data=False)
+            fill_data=True)
 
         kwarg_shapes = [k for _, args, k in shapes if not args]
         with_fill = [i for i, k in enumerate(kwarg_shapes) if "fill_data" in k]

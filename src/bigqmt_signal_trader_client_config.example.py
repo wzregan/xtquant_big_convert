@@ -61,6 +61,9 @@ BIGQMT_LOCAL_CACHE_CONFIG = {
     # "parquet" (columnar/compressed/cross-language — recommended), or "pkl".
     # One file per (period, dividend_type, code); switching format auto-migrates.
     "format": "auto",
+    # 热数据内存副本的字节数和文件数上限；任一设为 0 可禁用内存缓存。
+    "memory_max_bytes": 64 * 1024 * 1024,
+    "memory_max_entries": 32,
 }
 
 # FormulaServer direct read fast-path (port 58600).
@@ -101,4 +104,3 @@ BIGQMT_FORMULA_SERVER_CONFIG = {
 #     (default 30s = 10 periods, configured server-side).
 BIGQMT_QUOTE_CLIENT_ID = None  # e.g. "my-strategy-1"; None -> persisted auto id
 # BIGQMT_QUOTE_HEARTBEAT_SECONDS = 3.0  # env var; must be < server timeout/periods
-

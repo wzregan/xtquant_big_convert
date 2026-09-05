@@ -298,6 +298,7 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(single.m_strStockCode, "600000.SH")
 
     def test_orders_trades_order_and_cancel_are_miniqmt_shaped(self):
+        """验证委托成交字段，以及同步撤单的 MiniQMT 整数状态码。"""
         trader = self._trader()
         acc = StockAccount("acct")
 

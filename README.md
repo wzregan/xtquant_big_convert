@@ -10,6 +10,8 @@
 
 已发布 PyPI，客户端一行安装：`pip install xtquant-big-convert`（详见下文「环境要求与依赖安装」）。
 
+工作区的性能改进、离线对比结果及接口升级事项见 [2026-09-05 优化说明](docs/PERFORMANCE_OPTIMIZATION_20260905.md)。这些改动尚未发布到 PyPI。
+
 另附 [qmt-trader skill](qmt-trader/)：让 Claude Code / ZCode / Cursor 等 AI 助手通过统一 CLI（47 个子命令）直接查行情、算期权 Greeks、查持仓、下单撤单，详见下文「AI 助手 Skill：qmt-trader」。
 
 想看跑在这座桥上的完整应用长什么样，见 [bigqmt-dashboard](https://github.com/litaolemo/bigqmt_dashboard)——一个多账号持仓监控与下单面板，详见下文「基于本项目的应用」。
@@ -69,7 +71,7 @@ python -m bigqmt_signal_trader.init_config
 
 ### RPC 接口（远程可调用）
 
-通过 RPC 可调用的大 QMT 能力（**白名单 137 个只读方法 + 3 个下单方法（`submit_order` / `submit_orders_batch` / `cancel_order`）+ MiniQMT 风格别名**，覆盖官方文档全部交易/查询函数）：
+通过 RPC 暴露的大 QMT 能力如下；白名单表示桥接可路由的方法，实际支持情况取决于柜台版本和权限，完整 MiniQMT 语义仍有差异：
 
 | 类别 | 方法 |
 |------|------|

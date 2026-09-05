@@ -61,6 +61,7 @@ def _config_bool(value, default=False):
 
 
 def build_app(context_info=None, config=None):
+    """按配置装配运行适配器；没有实际快照接收端时默认关闭账户快照查询。"""
     config = config or {}
     mode = str(config.get("mode") or "dryrun").lower()
     account_id = config.get("account_id", "default")
@@ -156,4 +157,9 @@ def build_app(context_info=None, config=None):
         state_store=state_store or NoopStateStore(),
         consumer_id=config.get("consumer_id", "bigqmt-signal-trader"),
         fetch_limit=config.get("fetch_limit", 20),
+        position_sync_interval_seconds=config.get("position_sync_interval_seconds", 0.0),
+        position_sync_enabled=_config_bool(
+            config.get("position_sync_enabled"),
+            not isinstance(position_sync_sink or NoopPositionSyncSink(), NoopPositionSyncSink),
+        ),
     )

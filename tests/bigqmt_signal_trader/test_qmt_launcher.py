@@ -70,7 +70,9 @@ class ProcessStub(object):
 
 class ResolveInstallDirTest(unittest.TestCase):
     def test_accepts_root_bin_and_exe_paths(self):
-        expected = os.path.normpath("D:/qmt_lemo/bin.x64")
+        """在当前测试平台比较绝对路径，同时覆盖安装根目录、bin 目录与程序路径。"""
+        # 被测函数按所在系统生成绝对路径；Linux 不把 D: 识别为盘符。
+        expected = os.path.abspath("D:/qmt_lemo/bin.x64")
         orig = os.path.isdir
         os.path.isdir = lambda p: os.path.basename(os.path.normpath(p)).lower() == "bin.x64"
         try:

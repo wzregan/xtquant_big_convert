@@ -49,6 +49,8 @@ BIGQMT_REDIS_CONFIG = {
     "rpc_background_threads": False,
     "schedule_adjust": True,
     "schedule_adjust_interval": "100nMilliSecond",
+    # 账户快照兜底刷新间隔（秒），成交事件立即刷新；0 恢复每轮刷新。
+    "position_sync_interval_seconds": 3.0,
     # The default mode calls get_full_tick through RPC. Enable this cache only
     # if full-market payloads are too large for your latency/CPU budget.
     # When a client calls get_full_tick, it renews demand for 10 seconds.

@@ -1,6 +1,7 @@
 """信号交易应用编排层。"""
 
 import datetime as _dt
+import time
 
 from .models import AccountSnapshot, OrderRequest, SignalAction
 from .price_engine import build_order_price
@@ -19,7 +20,10 @@ class SignalTradingApp:
         state_store,
         consumer_id="bigqmt-signal-trader",
         fetch_limit=20,
+        position_sync_interval_seconds=0.0,
+        position_sync_enabled=True,
     ):
+        """创建信号应用；快照间隔单位为秒，0 表示每轮同步，成交事件始终立即同步。"""
         self.account_id = account_id
         self.signal_source = signal_source
         self.market_data = market_data
@@ -29,13 +33,20 @@ class SignalTradingApp:
         self.state_store = state_store
         self.consumer_id = consumer_id
         self.fetch_limit = int(fetch_limit)
+        self.position_sync_interval_seconds = max(0.0, float(position_sync_interval_seconds))
+        self.position_sync_enabled = bool(position_sync_enabled)
+        self._last_position_sync = None
 
     def tick(self, now=None):
+        """有待处理信号时读取风控持仓，空闲时仅按快照刷新间隔读取账户数据。"""
         now = now or _dt.datetime.now()
         signals = self.signal_source.fetch(self.account_id, self.fetch_limit)
-        positions = self.position_provider.get_positions(self.account_id)
+        positions = None
 
         for signal in signals:
+            # 读取失败必须发生在认领之前，保持信号可重试，不能将行情故障记成信号失败并 ack。
+            if positions is None:
+                positions = self.position_provider.get_positions(self.account_id)
             if not self.state_store.claim(signal, self.consumer_id):
                 continue
             try:
@@ -44,7 +55,10 @@ class SignalTradingApp:
                 self.state_store.mark_finished(signal.signal_id, "FAILED", str(exc))
                 self.signal_source.ack(signal)
 
-        self.sync_positions("tick", now=now)
+        last_sync = self._last_position_sync
+        if last_sync is None or time.monotonic() - last_sync >= self.position_sync_interval_seconds:
+            # 不复用下单前的风控持仓：柜台可能在本轮处理期间更新冻结量或成交。
+            self.sync_positions("tick", now=now)
 
     def _handle_signal(self, signal, now, positions):
         decision = validate_signal(signal, now, positions)
@@ -85,6 +99,9 @@ class SignalTradingApp:
         self.sync_positions("trade_event")
 
     def sync_positions(self, reason, now=None):
+        """立即发布最新账户快照；仅成功发布后推进节流时间，失败可在下轮重试。"""
+        if not self.position_sync_enabled:
+            return
         now = now or _dt.datetime.now()
         asset = self.position_provider.get_asset(self.account_id)
         positions = self.position_provider.get_positions(self.account_id)
@@ -96,3 +113,4 @@ class SignalTradingApp:
             updated_at=now,
         )
         self.position_sync_sink.publish(snapshot)
+        self._last_position_sync = time.monotonic()

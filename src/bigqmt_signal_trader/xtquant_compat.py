@@ -13,6 +13,7 @@ import queue as _queue
 from collections import OrderedDict as _OrderedDict
 import threading
 import importlib
+import importlib.util
 import datetime as _dt
 from typing import Any, Dict, Iterable, List, Optional
 # Only these three are used below, but every public constant is re-exported
@@ -31,6 +32,7 @@ from .full_tick_cache import request_full_tick_cache, wait_full_tick_cache
 from .local_cache import LocalMarketCache
 from .order_id import OrderId, order_sys_id_of
 from .redis_rpc import TYPED_PAYLOAD_FLAG, call_redis_rpc
+from .async_worker import AsyncWorker
 from .logging_setup import get_logger
 
 log = get_logger("xtquant_compat")
@@ -425,14 +427,21 @@ def _account_type_code(value):
 
 
 def _restore_jsonable(value):
+    """还原 RPC 对象；兼容旧 records 响应和协商后的按列响应。"""
     if isinstance(value, dict):
         marker = value.get("__bigqmt_type__")
         if marker == "DataFrame":
             try:
-                import pandas as pd
+                from .dataframe_wire import restore_frame
 
-                return pd.DataFrame(value.get("records") or [], columns=value.get("columns") or None)
+                return restore_frame(value)
+            except ImportError:
+                if value.get("orient") == "columns_v1":
+                    raise
+                return value.get("records") or []
             except Exception:
+                if value.get("frame_metadata"):
+                    raise
                 return value.get("records") or []
         if marker == "Panel":
             # pandas dropped Panel in 1.0, so a 3-D object cannot be rebuilt on
@@ -792,6 +801,8 @@ class BigQmtRpcClient:
                 or os.environ.get("BIGQMT_LOCAL_CACHE_FORMAT")
                 or "auto"  # parquet if pyarrow is available, else pickle
             ),
+            "memory_max_bytes": int(local_cache_config.get("memory_max_bytes", 64 * 1024 * 1024)),
+            "memory_max_entries": int(local_cache_config.get("memory_max_entries", 32)),
         }
         # Transport selection. Default "redis" keeps the legacy call_redis_rpc
         # path (so existing client configs are unchanged). Setting transport to
@@ -888,10 +899,13 @@ class BigQmtRpcClient:
         return self._formula_router_instance
 
     def call(self, method, params=None, account_id=None, timeout_seconds=None, use_formula=True):
+        """调用 RPC 并协商帧格式；timeout_seconds 控制传输等待秒数，None 使用客户端默认值。"""
         target_account = str(account_id or self.account_id or "")
         if not target_account:
             raise ValueError(_missing_account_id_message())
         wait_seconds = self.timeout_seconds if timeout_seconds is None else timeout_seconds
+        # 未安装 Pandas 的轻量客户端仍依赖 records 列表，不能协商它无法还原的格式。
+        dataframe_format = "columns_v1" if importlib.util.find_spec("pandas") is not None else "records"
         # Fast path: reference/history reads answered straight by QMT's
         # FormulaServer, bypassing the strategy process and its GIL. Anything it
         # declines (unmapped method, untranslatable params, server down) raises
@@ -936,6 +950,7 @@ class BigQmtRpcClient:
                 "method": method,
                 "params": params or {},
                 "ttl_seconds": 60,
+                "dataframe_format": dataframe_format,
             }
             response = transport.send_request(request, wait_seconds)
         else:
@@ -945,6 +960,7 @@ class BigQmtRpcClient:
                 method=method,
                 params=params or {},
                 timeout_seconds=wait_seconds,
+                dataframe_format=dataframe_format,
             )
         if not response.get("ok"):
             raise RpcServerRepliedError(
@@ -1347,15 +1363,21 @@ class BigQmtXtData:
         return self._subscribe_seq
 
     def _local_cache(self):
+        """按客户端配置惰性创建本地缓存，内存副本同时受字节数和条目数限制。"""
         cfg = dict(getattr(self.client, "local_cache_config", {}) or {})
         if not _bool_value(cfg.get("enabled"), True):
             return None
         if self._cache_obj is None:
-            self._cache_obj = LocalMarketCache(cache_dir=cfg.get("dir"), fmt=cfg.get("format", "auto"))
+            self._cache_obj = LocalMarketCache(
+                cache_dir=cfg.get("dir"), fmt=cfg.get("format", "auto"),
+                memory_max_bytes=cfg.get("memory_max_bytes", 64 * 1024 * 1024),
+                memory_max_entries=cfg.get("memory_max_entries", 32),
+            )
         return self._cache_obj
 
-    def _call(self, method, **params):
-        return self.client.call(method, params)
+    def _call(self, method, timeout_seconds=None, **params):
+        """转发行情请求；timeout_seconds 是客户端等待秒数，不属于服务端业务参数。"""
+        return self.client.call(method, params, timeout_seconds=timeout_seconds)
 
     def get_full_tick(self, code_list, timeout_seconds=None, types=None):
         """Fetch full tick data for a list of codes.
@@ -2801,6 +2823,7 @@ class BigQmtXtTrader:
         redis_config=None,
         timeout_seconds=None,
     ):
+        """创建交易桥接客户端；account_id 为柜台账号，timeout_seconds 为 RPC 等待秒数。"""
         self.path = path
         self.session_id = session_id
         self.client = BigQmtRpcClient(
@@ -2830,6 +2853,8 @@ class BigQmtXtTrader:
         # ping reports, fall back to what the caller declared.
         self._server_account_type = ""
         self._declared_account_type = ""
+        # 查询和撤单使用独立队列，保留上游批量下单及回调调度器。
+        self._request_worker = AsyncWorker("bigqmt-async-request")
 
     def _cached_position_snapshot(self, account_id):
         key = "bigqmt:positions:%s" % str(account_id or self.client.account_id or "")
@@ -2938,14 +2963,16 @@ class BigQmtXtTrader:
         return 0
 
     def stop(self):
+        """停止监听；保留上游下单排空流程，并限时等待已接收的查询与撤单。"""
         # Drain first: orders already queued must go out before teardown.
         # Costs nothing when the queue is empty (issue #156).
         self._drain_async_orders_on_exit()
+        deadline = time.monotonic() + 1.0
+        self._request_worker.close(timeout=1.0)
         self._event_running = False
         thread = self._event_thread
-        if thread is not None and thread.is_alive():
-            thread.join(1.0)
-        self._event_thread = None
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(max(0.0, deadline - time.monotonic()))
         return 0
 
     def _start_event_listener(self):
@@ -3577,9 +3604,10 @@ class BigQmtXtTrader:
         order_volume,
         price_type,
         price,
-        strategy_name,
-        order_remark,
+        strategy_name="",
+        order_remark="",
     ):
+        """提交证券委托，策略名与备注可省略；返回兼容整数的 OrderId 或 -1。"""
         data = self.order_stock_result(
             account, stock_code, order_type, order_volume, price_type,
             price, strategy_name, order_remark,
@@ -3641,15 +3669,9 @@ class BigQmtXtTrader:
 
     def order_stock_result(
         self, account, stock_code, order_type, order_volume, price_type,
-        price, strategy_name, order_remark, wait_settlement=True,
+        price, strategy_name="", order_remark="", wait_settlement=True,
     ):
-        """Submit one order over RPC.
-
-        ``wait_settlement=False`` tells the server to reply as soon as passorder
-        returns instead of holding the reply until QMT assigns the order id.
-        The async path uses it; the id then arrives through order_callback
-        (issue #50).
-        """
+        """返回委托提交详情；wait_settlement=False 时不等待柜台分配系统委托号。"""
         account_id = _account_id(account, self.client.account_id)
         user_order_id = str(order_remark or "").strip()
         if not user_order_id:
@@ -4223,6 +4245,10 @@ class BigQmtXtTrader:
                 time.sleep(0.005)
         return True
 
+    def wait_async_requests(self, timeout=10.0):
+        """等待异步查询、撤单及其回调结束；timeout 单位为秒，超时返回 False。"""
+        return self._request_worker.wait(timeout)
+
     def order_stock_batch(self, account, orders, batch_id="", idempotent=True,
                           timeout_seconds=None):
         """Submit N orders in one RPC.
@@ -4306,13 +4332,7 @@ class BigQmtXtTrader:
         return self.client.call("passorder", params, account_id=account_id)
 
     def cancel_order_stock_sysid(self, account, market, order_sysid):
-        """MiniQMT contract: 0 on success, -1 on failure (issue #113).
-
-        This returned a bool, which is worse than a type mismatch -- it inverts
-        the meaning. ``if trader.cancel_order_stock(...) == 0`` is how MiniQMT
-        code checks success, and ``False == 0`` is True, so a *failed* cancel
-        read as a successful one while a successful one read as failed.
-        """
+        """按系统委托号撤单；按 MiniQMT 约定返回 0 表示成功、-1 表示失败。"""
         account_id = _account_id(account, self.client.account_id)
         data = self.client.call(
             "cancel_order_stock_sysid",
@@ -4323,10 +4343,15 @@ class BigQmtXtTrader:
                 "order_sysid": self._resolve_order_sys_id(order_sysid),
             },
             account_id=account_id,
-        ) or {}
-        return 0 if bool(data.get("success", data)) else -1
+        )
+        if isinstance(data, dict):
+            return 0 if data.get("success") else -1
+        if isinstance(data, bool):
+            return 0 if data else -1
+        return 0 if isinstance(data, int) and data == 0 else -1
 
     def cancel_order_stock(self, account, order_id):
+        """按委托号撤单，返回 0 或 -1；同时接受桥接整数编号和柜台系统号。"""
         return self.cancel_order_stock_sysid(account, "", order_id)
 
     def unsubscribe(self, account):
@@ -4418,20 +4443,11 @@ class BigQmtXtTrader:
             return {}
 
     def query_new_purchase_limit(self, account):
-        """新股申购额度 (大 QMT get_new_purchase_limit).
-        返回 {板块: 额度} 或 {} (失败/无权限)."""
+        """查询账户新股申购额度；RPC 失败继续抛出异常，不能伪装为无额度。"""
         account_id = _account_id(account, self.client.account_id)
-        try:
-            data = self.client.call(
-                "get_new_purchase_limit",
-                {"account_id": account_id},
-                account_id=account_id,
-            ) or {}
-            if isinstance(data, dict):
-                return data
-            return {}
-        except Exception:
-            return {}
+        return self.client.call(
+            "get_new_purchase_limit", {"account_id": account_id}, account_id=account_id,
+        ) or {}
 
     def ipo_subscribe_all(self, account=None, stock_type="STOCK",
                           markets=("SH", "SZ"), dry_run=False,
@@ -4498,199 +4514,151 @@ class BigQmtXtTrader:
             FIX_PRICE, float(price), strategy_name, order_remark,
         )
 
-    # ------------------------------------------------------------------
-    # async 变体：MiniQMT 的 *_async 方法返回 seq 后异步回调。
-    # 在 RPC 模型里请求-响应本就是同步的，这里直接转发到同步实现并
-    # 返回一个递增 seq，让旧代码 ``xt_trader.query_stock_positions_async(acc)``
-    # 不报错（回调仍由 register_callback 注册的回调在事件来时触发）。
-    # ------------------------------------------------------------------
 
     _async_seq = 0
+    _async_seq_lock = threading.Lock()
 
     def _next_async_seq(self):
-        BigQmtXtTrader._async_seq += 1
-        return BigQmtXtTrader._async_seq
+        """为并发调用分配唯一的请求序号。"""
+        with BigQmtXtTrader._async_seq_lock:
+            BigQmtXtTrader._async_seq += 1
+            return BigQmtXtTrader._async_seq
 
     def _async_query(self, sync_call, account, callback, *args, **kwargs):
-        """Shared async query helper.
+        """后台执行查询；提供回调时返回 None，省略回调时保留桥接序号扩展。"""
+        if callback is not None and not callable(callback):
+            raise TypeError("callback must be callable")
+        seq = self._next_async_seq()
+        self._request_worker.submit(self._run_async_query, seq, sync_call, account, callback, args, kwargs)
+        return None if callback is not None else seq
 
-        MiniQMT's *_async query methods take a callback and hand the result to
-        it (they return None). We accept an OPTIONAL callback for compat: when
-        given, we call callback(result) synchronously (our RPC is already
-        synchronous) and return None like MiniQMT; when omitted, we keep our
-        seq-returning extension so existing callers don't break.
-        """
-        result = sync_call(account, *args, **kwargs)
+    def _run_async_query(self, seq, sync_call, account, callback, args, kwargs):
+        """分别记录 RPC 和用户回调异常，避免工作线程退出或把查询失败伪装为空结果。"""
+        name = getattr(sync_call, "__name__", "query")
+        try:
+            result = sync_call(account, *args, **kwargs)
+        except Exception:
+            log.exception("async query failed: %s seq=%s", name, seq)
+            return
         if callback is not None:
             try:
                 callback(result)
             except Exception:
-                log.exception(
-                    "user callback failed: %s",
-                    getattr(sync_call, "__name__", "async_query_callback"),
-                )
-            return None
-        return self._next_async_seq()
+                log.exception("user callback failed: %s seq=%s", name, seq)
+
+    def query_stock_orders_async(self, account, callback=None, cancelable_only=False):
+        """按原生顺序异步查委托；兼容旧桥接的 (account, bool, callback) 调用。"""
+        if isinstance(callback, bool):
+            callback, cancelable_only = (cancelable_only if callable(cancelable_only) else None), callback
+        return self._async_query(self.query_stock_orders, account, callback, cancelable_only)
 
     def query_stock_asset_async(self, account, callback=None):
+        """异步查询资产，callback 在工作线程接收结果。"""
         return self._async_query(self.query_stock_asset, account, callback)
 
     def query_stock_positions_async(self, account, callback=None):
+        """异步查询持仓，callback 在工作线程接收结果。"""
         return self._async_query(self.query_stock_positions, account, callback)
 
-    def query_stock_orders_async(self, account, cancelable_only=False, callback=None):
-        if callback is not None:
-            result = self.query_stock_orders(account, cancelable_only)
-            try:
-                callback(result)
-            except Exception:
-                pass
-            return None
-        return self._next_async_seq()
-
     def query_stock_trades_async(self, account, callback=None):
+        """异步查询成交，callback 在工作线程接收结果。"""
         return self._async_query(self.query_stock_trades, account, callback)
 
-    def query_account_infos_async(self, account=None, callback=None):
-        if callback is not None:
-            result = self.query_account_infos(account)
-            try:
-                callback(result)
-            except Exception:
-                pass
-            return None
-        return self._next_async_seq()
-
-    def query_account_status_async(self, account=None, callback=None):
-        if callback is not None:
-            result = self.query_account_status(account)
-            try:
-                callback(result)
-            except Exception:
-                pass
-            return None
-        return self._next_async_seq()
-
     def query_credit_detail_async(self, account, callback=None):
+        """异步查询信用账户详情，callback 在工作线程接收结果。"""
         return self._async_query(self.query_credit_detail, account, callback)
 
     def query_stk_compacts_async(self, account, callback=None):
+        """异步查询信用合约，callback 在工作线程接收结果。"""
         return self._async_query(self.query_stk_compacts, account, callback)
 
     def query_credit_subjects_async(self, account, callback=None):
+        """异步查询融资融券标的，callback 在工作线程接收结果。"""
         return self._async_query(self.query_credit_subjects, account, callback)
 
     def query_credit_slo_code_async(self, account, callback=None):
+        """异步查询可融券证券，callback 在工作线程接收结果。"""
         return self._async_query(self.query_credit_slo_code, account, callback)
 
     def query_credit_assure_async(self, account, callback=None):
+        """异步查询信用担保品，callback 在工作线程接收结果。"""
         return self._async_query(self.query_credit_assure, account, callback)
 
-    def query_ipo_data_async(self, account=None, callback=None):
-        if callback is not None:
-            result = self.query_ipo_data(account)
-            try:
-                callback(result)
-            except Exception:
-                log.exception("user callback failed: query_ipo_data_async")
-            return None
-        return self._next_async_seq()
-
     def query_new_purchase_limit_async(self, account, callback=None):
+        """异步查询新股额度，callback 在工作线程接收结果。"""
         return self._async_query(self.query_new_purchase_limit, account, callback)
 
     def query_appointment_info_async(self, account, callback=None):
+        """异步查询预约信息，callback 在工作线程接收结果。"""
         return self._async_query(self.query_appointment_info, account, callback)
 
-    def cancel_order_stock_async(self, account, order_id):
-        # MiniQMT: returns seq, result comes back via on_cancel_order_stock_async_response.
-        seq = self._next_async_seq()
+    def query_account_infos_async(self, account=None, callback=None):
+        """异步查询账户；支持原生 (callback) 及桥接扩展 (account, callback)。"""
+        if callable(account) and callback is None:
+            account, callback = None, account
+        return self._async_query(self.query_account_infos, account, callback)
+
+    def query_account_status_async(self, account=None, callback=None):
+        """异步查询账户状态；支持原生 (callback) 及桥接扩展 (account, callback)。"""
+        if callable(account) and callback is None:
+            account, callback = None, account
+        return self._async_query(self.query_account_status, account, callback)
+
+    def query_ipo_data_async(self, account=None, callback=None):
+        """异步查询新股数据；支持原生 (callback) 及桥接扩展 (account, callback)。"""
+        if callable(account) and callback is None:
+            account, callback = None, account
+        return self._async_query(self.query_ipo_data, account, callback)
+
+    def _run_async_cancel(self, seq, cancel_call, account, order_id, args):
+        """在后台撤单并分发含序号的响应；异常与柜台拒绝分别保留诊断信息。"""
+        account_id = _account_id(account, self.client.account_id)
+        sysid = self._resolve_order_sys_id(order_id)
         try:
-            # 0 == success now (MiniQMT contract, issue #113), so a bare
-            # truthiness test on the return would read backwards.
-            ok = self.cancel_order_stock(account, order_id) == 0
+            result = cancel_call(account, *args)
         except Exception as exc:
             callback = self.callback
             if callback is not None:
                 try:
-                    callback.on_cancel_error(
-                        CompatObject(
-                            error_id=getattr(exc, "errno", 0),
-                            error_msg=str(exc),
-                            order_sysid=str(order_id or ""),
-                            order_sys_id=str(order_id or ""),
-                            order_id=self._order_object_id(order_id),
-                            stock_code="",
-                        )
-                    )
+                    callback.on_cancel_error(CompatObject(
+                        account_id=account_id, seq=seq,
+                        error_id=getattr(exc, "errno", -1), error_msg=str(exc),
+                        order_sys_id=str(sysid or ""), order_sysid=str(sysid or ""),
+                        order_id=self._order_object_id(sysid), stock_code="",
+                    ))
                 except Exception:
-                    log.exception("user callback failed: on_cancel_error")
-            return seq
+                    log.exception("user callback failed: on_cancel_error seq=%s", seq)
+            return
         callback = self.callback
         if callback is not None:
+            # 同步撤单成功返回 0，不能用 bool(result) 反向判定成功。
+            success = result == 0
             try:
-                callback.on_cancel_order_stock_async_response(
-                    CompatObject(
-                        account_id=self.client.account_id,
-                        seq=seq,
-                        success=bool(ok),
-                        # MiniQMT XtCancelOrderResponse 契约: cancel_result=0 成功,
-                        # 失败时给出非零错误码和可读 error_msg。
-                        cancel_result=0 if ok else -1,
-                        error_msg="" if ok else "cancel_order_stock rejected by server",
-                        order_sysid=str(order_id or ""),
-                        order_sys_id=str(order_id or ""),
-                        order_id=self._order_object_id(order_id),
-                    ),
-                )
+                callback.on_cancel_order_stock_async_response(CompatObject(
+                    account_id=account_id, seq=seq, success=success,
+                    cancel_result=0 if success else -1,
+                    error_msg="" if success else "cancel_order_stock rejected by server",
+                    order_sys_id=str(sysid or ""), order_sysid=str(sysid or ""),
+                    order_id=self._order_object_id(sysid),
+                ))
             except Exception:
-                log.exception(
-                    "user callback failed: on_cancel_order_stock_async_response seq=%s", seq
-                )
+                log.exception("user callback failed: on_cancel_order_stock_async_response seq=%s", seq)
+
+    def cancel_order_stock_async(self, account, order_id):
+        """异步撤单并立即返回请求序号，结果由 on_cancel_order_stock_async_response 接收。"""
+        seq = self._next_async_seq()
+        self._request_worker.submit(
+            self._run_async_cancel, seq, self.cancel_order_stock, account, order_id, (order_id,),
+        )
         return seq
 
     def cancel_order_stock_sysid_async(self, account, market, order_sysid):
+        """按市场及系统委托号异步撤单并立即返回序号；回调在工作线程执行。"""
         seq = self._next_async_seq()
-        try:
-            ok = self.cancel_order_stock_sysid(account, market, order_sysid) == 0
-        except Exception as exc:
-            callback = self.callback
-            if callback is not None:
-                try:
-                    callback.on_cancel_error(
-                        CompatObject(
-                            error_id=getattr(exc, "errno", 0),
-                            error_msg=str(exc),
-                            order_sysid=str(order_sysid or ""),
-                            order_sys_id=str(order_sysid or ""),
-                            order_id=self._order_object_id(order_sysid),
-                            stock_code="",
-                        )
-                    )
-                except Exception:
-                    log.exception("user callback failed: on_cancel_error")
-            return seq
-        callback = self.callback
-        if callback is not None:
-            try:
-                callback.on_cancel_order_stock_async_response(
-                    CompatObject(
-                        account_id=self.client.account_id,
-                        seq=seq,
-                        success=bool(ok),
-                        # MiniQMT XtCancelOrderResponse 契约: cancel_result=0 成功,
-                        # 失败时给出非零错误码和可读 error_msg。
-                        cancel_result=0 if ok else -1,
-                        error_msg="" if ok else "cancel_order_stock rejected by server",
-                        order_sysid=str(order_sysid or ""),
-                        order_sys_id=str(order_sysid or ""),
-                        order_id=self._order_object_id(order_sysid),
-                    ),
-                )
-            except Exception:
-                log.exception(
-                    "user callback failed: on_cancel_order_stock_async_response seq=%s", seq
-                )
+        self._request_worker.submit(
+            self._run_async_cancel, seq, self.cancel_order_stock_sysid, account,
+            order_sysid, (market, order_sysid),
+        )
         return seq
 
     def set_relaxed_response_order_enabled(self, enabled=True):
