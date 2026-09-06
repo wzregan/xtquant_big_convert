@@ -736,9 +736,13 @@ class BigQmtRpcHandlers:
                 info["credit_probe"][name] = {"available": False}
                 continue
             try:
-                rows = func(self.account_id) or []
+                # 合约接口还要求账户类型，探测必须与正式查询使用同一签名。
+                if name == "get_unclosed_compacts":
+                    rows = func(self.account_id, self._configured_account_type())
+                else:
+                    rows = func(self.account_id)
                 info["credit_probe"][name] = {
-                    "available": True, "ok": True, "rows": len(rows),
+                    "available": True, "ok": True, "rows": len(rows) if rows is not None else 0,
                 }
             except Exception as exc:
                 info["credit_probe"][name] = {

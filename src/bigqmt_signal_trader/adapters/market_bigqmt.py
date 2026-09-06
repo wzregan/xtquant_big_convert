@@ -821,33 +821,17 @@ class BigQmtMarketDataProvider:
     _DIVID_PRICE_EPSILON = 1e-4
 
     def get_divid_factors(self, stock_code, start_time="", end_time=""):
-        """Dividend factors over a RANGE, not just one day (issue #165).
+        """按 YYYYMMDD 日期区间读取除权因子，保留原生 DataFrame 或旧字典结构。
 
-        This used to collapse any range to ``end_time or start_time`` and ask
-        for that single day. Since a given day is almost never an ex-dividend
-        day, a range request answered ``{}`` -- and an empty dict is
-        indistinguishable from "no events in this range". A reporter's nightly
-        whole-market factor sync ran that way for a month: every symbol
-        returned empty, the factor table silently stopped updating, and nothing
-        errored because K-lines kept arriving normally.
-
-        The old comment claimed "the xtdata SDK has the same 2-arg shape". It
-        does not -- the terminal's bundled SDK is
-        ``get_divid_factors(stock_code, start_time, end_time)``. So try the
-        range shapes first, and only fall back to expanding the range here.
-
-        The expansion does not walk every trading day. An ex-dividend day is
-        exactly a day whose ``preClose`` differs from the previous bar's
-        ``close`` (that is what the adjusted reference price means), so one
-        daily-bar read narrows a two-year window to a handful of candidates,
-        and only those get probed.
+        优先使用支持区间的接口；仅支持单日的终端通过日线筛选候选除权日，
+        避免把区间错误缩为结束日，也避免逐个交易日调用。
         """
         start = str(start_time or "").strip()
         end = str(end_time or "").strip()
         if not start and not end:
             return self._call_context("get_divid_factors", stock_code)
         if not start or not end or start == end:
-            # A single day was asked for; answer it directly.
+            # 单日请求保持终端原有语义。
             return self._call_context("get_divid_factors", stock_code, end or start)
 
         for shape in (
@@ -858,6 +842,9 @@ class BigQmtMarketDataProvider:
                 answer = shape()
             except Exception:
                 continue
+            # DataFrame 不支持布尔判断；空帧也是原生区间接口的有效答复。
+            if hasattr(answer, "columns") and hasattr(answer, "empty"):
+                return answer
             if answer:
                 return dict(answer)
 
@@ -900,14 +887,7 @@ class BigQmtMarketDataProvider:
         return candidates
 
     def _expand_divid_factors(self, stock_code, start_time, end_time):
-        """Aggregate single-day lookups over the candidate days.
-
-        Raises rather than returning ``{}`` when there were no daily bars to
-        scan. An empty dict would mean "no dividends in this range", and the
-        whole point of #165 is that a silent empty answer is what let a factor
-        table stop updating for a month unnoticed. No bars means we cannot
-        tell, and saying so is the only honest answer.
-        """
+        """合并候选日的因子；缺少日线时明确报错，不能冒充区间内无除权事件。"""
         self._divid_scan_rows = 0
         try:
             candidates = self._divid_candidate_days(stock_code, start_time, end_time)
@@ -926,13 +906,24 @@ class BigQmtMarketDataProvider:
                 "from 'no dividends in this range' (issue #165)."
                 % (stock_code, start_time, end_time, self._divid_scan_rows))
         merged = {}
+        frames = []
         for day in candidates[:self._DIVID_MAX_PROBES]:
             try:
                 answer = self._call_context("get_divid_factors", stock_code, day)
             except Exception:
                 continue
-            if answer:
+            if hasattr(answer, "columns") and hasattr(answer, "empty"):
+                frames.append(answer)
+            elif answer:
                 merged.update(answer)
+        if frames:
+            import pandas as pd
+
+            # 部分终端无事件时返回字典，有事件时返回帧；合并时保留因子列名。
+            if merged:
+                frames.append(pd.DataFrame(list(merged.values()), index=list(merged), columns=frames[0].columns))
+            result = pd.concat(frames)
+            return result.loc[~result.index.duplicated(keep="last")].sort_index()
         return merged
 
     def _download(self, func_name, sdk_args, sdk_kwargs, ctx_call):
@@ -1085,13 +1076,9 @@ class BigQmtMarketDataProvider:
         return self._call_context("get_his_option_list_batch", undl_code, start_time, end_time)
 
     def get_financial_data(self, stock_list, table_list=None, start_time="", end_time="", report_type="report_time"):
-        # ContextInfo stub signature: get_financial_data(fieldList, stockList, startDate, endDate, report_type)
-        # — fieldList (table_list) comes FIRST, stockList SECOND. Our public API keeps
-        # the xtdata order (stock_list, table_list) so callers don't change, but we
-        # must swap when forwarding to ContextInfo.
-        # Big QMT also wants dotted "BIGTABLE.field" entries, not MiniQMT table
-        # names — translate whole-table names to the full field list (issue #52).
-        return self._call_context(
+        """读取财务数据；日期为 YYYYMMDD，report_type 区分公告日和报告期。"""
+        # QMT 字段参数在证券前，且要求 BIGTABLE.field；不能直接传 MiniQMT 表名。
+        result = self._call_context(
             "get_financial_data",
             _translate_financial_fields(table_list),
             stock_list,
@@ -1099,6 +1086,11 @@ class BigQmtMarketDataProvider:
             end_time,
             report_type,
         )
+        if hasattr(result, "columns") and not result.empty and result.isnull().all().all():
+            # 部分终端返回有日期但全 NaN 的帧，行数非零不代表财务数据已落地。
+            raise RuntimeError("get_financial_data returned only missing values; "
+                               "download_financial_data and verify terminal data permissions first")
+        return result
 
     def download_financial_data(self, stock_list, table_list=None, start_time="", end_time="", incrementally=None):
         # download_financial_data is an xtdata SDK function, not a ContextInfo method.
@@ -1409,8 +1401,15 @@ class BigQmtMarketDataProvider:
         return self._call_context("get_date_location", date)
 
     def get_ETF_list(self, market, stock_code, type_list=None):
-        # ContextInfo stub: get_ETF_list(market, stockcode, typeList=[])
-        return self._call_context("get_ETF_list", market, stock_code, list(type_list or []))
+        """按市场、证券和类型列表查询 ETF，明确报告终端缺少底层绑定的情况。"""
+        try:
+            return self._call_context("get_ETF_list", market, stock_code, list(type_list or []))
+        except NameError as exc:
+            # 券商 _PyContextInfo.py 使用了未定义的全局函数，不能用普通板块列表冒充结果。
+            if "get_etf_list" not in str(exc):
+                raise
+            raise NotImplementedError("get_ETF_list unavailable: terminal _PyContextInfo.py "
+                                      "is missing the get_etf_list binding") from exc
 
     # ------------------------------------------------------------------
     # 北向资金 / 港股通

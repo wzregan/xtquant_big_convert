@@ -131,9 +131,9 @@ $env:PYTHONPATH = "D:\gjzqqmt\xtquant_big_convert\src;$env:PYTHONPATH"
 | `xtdata.subscribe_quote(...)` | 部分兼容 | tick 使用连续推送，K 线通过实时 RPC 轮询；时序仍与原生订阅存在差异 |
 | `xtdata.subscribe_whole_quote(...)` | 已接入 | 独立推送通道接收增量快照，包含订阅引用计数及心跳 |
 | `xtdata.unsubscribe_quote(seq)` | 已接入 | 取消推送会话或 K 线轮询并删除订阅记录 |
-| `xtdata.get_market_data(...)` | 已接入 RPC | 透传到大 QMT `ContextInfo.get_market_data`，返回 DataFrame/字典结构会自动 JSON 化再还原 |
-| `xtdata.get_market_data_ex(...)` | 已接入 RPC | 大 QMT 不支持 `get_market_data_ex` 时回退到 `get_market_data` |
-| `xtdata.get_local_data(...)` | 已接入 RPC | 大 QMT 不支持 `get_local_data` 时回退到 `get_market_data` |
+| `xtdata.get_market_data(...)` | 已接入 RPC | K 线统一为 `{字段: DataFrame}`，行是证券、列是时间；兼容旧字典响应 |
+| `xtdata.get_market_data_ex(...)` | 已接入 RPC | 返回 `{证券: DataFrame}`，行是时间；旧终端可回退到 `get_market_data` |
+| `xtdata.get_local_data(...)` | 已接入 RPC | 缓存启用和禁用均返回 `{证券: DataFrame}`；终端不支持时回退到 `get_market_data` |
 | `xtdata.get_stock_list_in_sector(...)` | 已接入 RPC | 优先调大 QMT；失败时对 `"沪深A股"` 用 `get_full_tick(["SH","SZ"])` 过滤 |
 | `xtdata.get_sector_list()` / `get_sector_info()` | 已接入 RPC | 依赖大 QMT `ContextInfo` 是否支持 |
 | `xtdata.get_divid_factors(...)` | 已接入 RPC | 依赖大 QMT `ContextInfo` 是否支持 |
@@ -146,6 +146,10 @@ $env:PYTHONPATH = "D:\gjzqqmt\xtquant_big_convert\src;$env:PYTHONPATH"
 | `xtdata.call_formula(...)` / `subscribe_formula(...)` / `unsubscribe_formula(...)` / `get_formula_result(...)` | 已接入 RPC | 对应截图里的模型调用/订阅能力，依赖大 QMT `ContextInfo` 是否支持 |
 | `xtdata.gen_factor_index(...)` | 已接入 RPC | 对应生成因子数据，依赖大 QMT `ContextInfo` 是否支持 |
 | `query_ipo_data()` / `query_new_purchase_limit()` | 已接入 RPC | 分别映射到大 QMT 新股数据和申购额度查询；具体返回字段依赖柜台版本，尚未做真机逐字段对账 |
+
+K 线请求包含 OHLC 字段时，客户端会过滤最早真实价格之前的全零价或空价占位行，再写入缓存，并记录历史不足警告。`count` 是请求上限，不能保证终端已有这么多根有效历史；需要先下载再读回验证。零成交量和负价格不会据此被删除，只有成交量字段时也不会用零成交量推断历史缺失。
+
+终端返回有日期行但全为 NaN 的财务 DataFrame 时，接口会明确报错，提示补充财务数据并核实权限。下载调用返回不等于数据已经可用，仍需读回检查。券商终端缺少 `get_etf_list` 底层绑定时，`get_ETF_list` 报 `NotImplementedError`，不会用其他列表代替。
 
 ## 下单开关
 

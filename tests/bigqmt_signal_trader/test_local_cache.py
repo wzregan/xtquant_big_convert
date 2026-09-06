@@ -863,15 +863,15 @@ class AdjustedReadSelfHealTest(unittest.TestCase):
         self.assertNotIn("download_history_data2", method_calls)
         self.assertEqual(method_calls.count("get_market_data"), 1)
 
-    def test_none_read_does_not_self_heal(self):
+    def test_none_read_filters_placeholder_without_implicit_download(self):
+        """未复权行情也会零填充，过滤占位但不把普通读取变为隐式下载。"""
         xt = self._xt()
         data = xt.get_market_data_ex(
             field_list=["close"], stock_list=["600000.SH"], period="1d",
             dividend_type="none",
         )
-        # none read that comes back complete (every requested code served)
-        # does not heal: returns whatever the server sent, single pull.
-        self.assertEqual(list(data["600000.SH"]["close"]), [0.0, 8.73])
+        # 原始库缺少早期历史时，只返回真实价格，并保持单次 RPC。
+        self.assertEqual(list(data["600000.SH"]["close"]), [8.73])
         method_calls = [m for m, _ in xt.client.call_params]
         self.assertNotIn("download_history_data2", method_calls)
         self.assertEqual(method_calls.count("get_market_data_ex"), 1)

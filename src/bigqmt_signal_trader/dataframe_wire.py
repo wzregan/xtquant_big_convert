@@ -9,7 +9,10 @@ def _encode_axis(axis, encode):
         "dtypes": [str(axis.get_level_values(i).dtype) for i in range(axis.nlevels)],
     }
     if type(axis).__name__ == "RangeIndex":
-        meta["range"] = [axis.start, axis.stop, axis.step]
+        # QMT 内置 pandas 0.22 只有私有属性；不能让普通整数索引使整帧退化为文本。
+        meta["range"] = [getattr(axis, name) if hasattr(axis, name)
+                         else getattr(axis, "_" + name)
+                         for name in ("start", "stop", "step")]
     freq = getattr(axis, "freqstr", None)
     if freq:
         meta["freq"] = freq

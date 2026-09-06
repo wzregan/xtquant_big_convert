@@ -618,11 +618,24 @@ def _qmt_datetime_to_epoch_ms(dt_value):
     return int(dt_value.replace(tzinfo=china_tz).timestamp() * 1000)
 
 
+def _trim_missing_bar_prefix(df):
+    """移除最早真实价格之前的零价或空价占位行，保留停牌零成交量和负价格。"""
+    prices = [name for name in ("open", "high", "low", "close") if name in df.columns]
+    if not prices or df.empty:
+        return df
+    values = df[prices]
+    missing = ((values == 0) | values.isnull()).all(axis=1).tolist()
+    start = next((i for i, empty in enumerate(missing) if not empty), len(missing))
+    return df.iloc[start:].copy() if start else df
+
+
 def _normalize_market_data_frame(df, field_list=None):
+    """删除缺失历史占位行，并把 QMT 的 stime 转为 MiniQMT 日期索引和毫秒时间。"""
     try:
         columns = list(df.columns)
     except Exception:
         return df
+    df = _trim_missing_bar_prefix(df)
     if "stime" not in columns:
         return df
 
@@ -647,13 +660,44 @@ def _normalize_market_data_frame(df, field_list=None):
         return df
 
 
-def _normalize_market_data_result(data, field_list=None):
+def _normalize_market_data_result(data, field_list=None, stock_list=None):
+    """统一单股帧、证券分组和字段分组为证券到时间序列帧；旧字典继续兼容。"""
+    codes = list(stock_list or [])
+    if hasattr(data, "columns") and len(codes) == 1:
+        data = {codes[0]: data}
     if not isinstance(data, dict):
         return data
-    return {
+    # get_market_data 的字段帧以证券为行、时间为列；转置后与 ex/local 一致。
+    if codes and not any(code in data for code in codes) and data and all(
+        hasattr(frame, "columns") for frame in data.values()
+    ):
+        import pandas as pd
+
+        data = {
+            code: pd.DataFrame({field: frame.loc[code]
+                                for field, frame in data.items() if code in frame.index})
+            for code in codes if any(code in frame.index for frame in data.values())
+        }
+    result = {
         code: _normalize_market_data_frame(frame, field_list=field_list)
         for code, frame in data.items()
     }
+    removed = sum(len(frame) - len(result[code]) for code, frame in data.items()
+                  if hasattr(frame, "columns"))
+    if removed:
+        log.warning("QMT 历史数据不足，已过滤 %d 行开头的零价/空价占位；请补充历史后重新读取。", removed)
+    return result
+
+
+def _market_data_field_frames(data):
+    """将证券到时间序列帧转换为 MiniQMT get_market_data 的字段帧。"""
+    if not isinstance(data, dict) or not data or not all(hasattr(frame, "columns") for frame in data.values()):
+        return data
+    import pandas as pd
+
+    fields = list(dict.fromkeys(field for frame in data.values() for field in frame.columns))
+    return {field: pd.DataFrame({code: frame[field] for code, frame in data.items()
+                                if field in frame.columns}).T for field in fields}
 
 
 def _normalize_code_for_filter(code):
@@ -1609,6 +1653,7 @@ class BigQmtXtData:
         dividend_type="none",
         fill_data=True,
     ):
+        """读取行情；K 线返回字段到证券行、时间列的数据帧，tick 保持原生结构。"""
         params = dict(
             field_list=list(field_list or []),
             stock_list=list(stock_list or []),
@@ -1620,8 +1665,11 @@ class BigQmtXtData:
             fill_data=fill_data,
         )
         data = self._call("get_market_data", **params)
-        # Self-heal adjusted reads (all-zero bars -> server raw download + retry).
-        return self._heal_adjusted("get_market_data", params, data)
+        data = self._heal_adjusted("get_market_data", params, data)
+        if str(period).lower() in ("tick", "full_tick"):
+            return data
+        return _market_data_field_frames(_normalize_market_data_result(
+            data, field_list=params["field_list"], stock_list=params["stock_list"]))
 
     def _get_market_data_ex_batch(self, params, timeout_seconds=None, use_formula=True):
         """One RPC's worth of bars, healed and normalized. No caching."""
@@ -1633,9 +1681,9 @@ class BigQmtXtData:
                                     use_formula=False)
         # Self-heal adjusted reads (all-zero bars -> server raw download + retry).
         data = self._heal_adjusted("get_market_data_ex", params, data, timeout_seconds=timeout_seconds)
-        # Normalize Big QMT's stime-indexed frame to MiniQMT shape (time-indexed).
-        if isinstance(data, dict):
-            data = _normalize_market_data_result(data, field_list=params.get("field_list"))
+        # 在进入缓存前过滤占位历史，并兼容只返回单个帧的终端。
+        data = _normalize_market_data_result(data, field_list=params.get("field_list"),
+                                             stock_list=params.get("stock_list"))
         return data
 
     @staticmethod
@@ -1878,16 +1926,15 @@ class BigQmtXtData:
         fill_data=True,
         data_dir=None,
     ):
-        """Read bars from the CLIENT-side local cache — no RPC to Big QMT.
+        """读取客户端缓存，禁用缓存时读取终端本地数据；均返回证券到数据帧的字典。
 
-        Returns a dict {code: DataFrame}. A cache-missed code is omitted, unless
-        local_cache_fallback_rpc is enabled (then it is fetched + cached over RPC).
+        缓存缺失时只在 fallback_rpc 启用后远程补读；data_dir 为终端数据目录。
         """
         codes = [str(c) for c in (stock_list or []) if str(c or "").strip()]
         cache = self._local_cache()
         if cache is None:
-            # Cache disabled -> behave like a plain RPC local-data read.
-            return self._call(
+            # 禁用缓存也必须保持与缓存命中相同的返回结构。
+            data = self._call(
                 "get_local_data",
                 field_list=_as_list(field_list),
                 stock_list=codes,
@@ -1899,6 +1946,7 @@ class BigQmtXtData:
                 fill_data=fill_data,
                 data_dir=data_dir,
             )
+            return _normalize_market_data_result(data, field_list=field_list, stock_list=codes)
         fields = list(field_list or [])
         result = {}
         missing = []
@@ -1981,14 +2029,15 @@ class BigQmtXtData:
             pass
 
     @staticmethod
-    def _served_codes(data):
-        """Codes the server actually served, across both return shapes:
-        get_market_data_ex is code-keyed ({code: DataFrame}), get_market_data
-        is field-keyed ({field: {code: [..]}}) -- reading keys off the wrong
-        level would make every code look missing."""
+    def _served_codes(data, requested_codes=()):
+        """识别证券字典、字段字典、字段帧及单股帧中实际返回的证券代码。"""
+        if hasattr(data, "columns"):
+            return set(requested_codes) if len(requested_codes) == 1 else set(data.index)
         if not isinstance(data, dict):
             return set()
         nested = {code for value in data.values() if isinstance(value, dict) for code in value}
+        if not any(code in data for code in requested_codes):
+            nested.update(code for value in data.values() if hasattr(value, "columns") for code in value.index)
         return nested if nested else set(data.keys())
 
     def _heal_adjusted(self, method, params, data, wait_seconds=2.0, timeout_seconds=None):
@@ -1998,18 +2047,9 @@ class BigQmtXtData:
         if not codes:
             return data
         if dividend_type in ("", "none"):
-            # None-adjusted bars are never zero-filled, so the all-zero
-            # detector does not apply -- a *missing* code means the server
-            # has no raw bars for it at all. Big QMT's raw store is not
-            # auto-populated market-wide (a --tick pipeline read 8 of 5225
-            # codes on 2026-08-30 because nothing ever downloaded the raw
-            # dailies), so heal that the same way. But a full-market read
-            # always has a few codes the server can never serve (delisted,
-            # suspended, no quote permission), and healing on *any* missing
-            # code made those a per-call cost -- raw download + sleep + full
-            # re-read, every time. Heal only when the majority came back
-            # missing: that is the raw-store-not-populated signal.
-            served = self._served_codes(data)
+            # 未复权数据也可能零填充；正常化时过滤占位，不能按行数判定历史完整。
+            # 只有缺码过半才自动补数，避免普通读取反复触发大范围下载。
+            served = self._served_codes(data, codes)
             missing = sum(1 for code in codes if code not in served)
             if missing * 2 <= len(codes):
                 return data
