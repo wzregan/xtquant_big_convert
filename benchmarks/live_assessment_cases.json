@@ -1,0 +1,1171 @@
+{
+  "description": "完整 RPC 清单；休市真机测试、交易保护、临时板块清理；原始业务值不写入证据",
+  "cases": [
+    {
+      "method": "ping",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "get_deployment_info",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "probe_capabilities",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "get_ticks",
+      "category": "账户与系统",
+      "params": {
+        "codes": [
+          "000001.SZ"
+        ]
+      }
+    },
+    {
+      "method": "get_full_tick",
+      "category": "MiniQMT 别名",
+      "params": {
+        "codes": [
+          "000001.SZ"
+        ]
+      },
+      "alias_of": "get_ticks"
+    },
+    {
+      "method": "get_asset",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "get_positions",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "query_orders",
+      "category": "账户与系统",
+      "params": {
+        "strategy_name": ""
+      }
+    },
+    {
+      "method": "query_trades",
+      "category": "账户与系统",
+      "params": {
+        "strategy_name": ""
+      }
+    },
+    {
+      "method": "get_stock_list_in_sector",
+      "category": "行情与参考数据",
+      "params": {
+        "sector_name": "沪深A股"
+      }
+    },
+    {
+      "method": "get_option_list",
+      "category": "行情与参考数据",
+      "params": {
+        "undl_code": "510050.SH",
+        "dedate": "202609"
+      }
+    },
+    {
+      "method": "bsm_iv",
+      "category": "行情与参考数据",
+      "params": {
+        "opt_type": "C",
+        "target_price": 3.0,
+        "strike_price": 2.8,
+        "option_price": 0.25,
+        "risk_free": 0.03,
+        "days": 30
+      }
+    },
+    {
+      "method": "bsm_price",
+      "category": "行情与参考数据",
+      "params": {
+        "opt_type": "C",
+        "target_price": 3.0,
+        "strike_price": 2.8,
+        "risk_free": 0.03,
+        "sigma": 0.3,
+        "days": 30
+      }
+    },
+    {
+      "method": "call_formula",
+      "category": "行情与参考数据",
+      "skip": "缺少已确认无交易副作用的公式样本，未执行任意公式"
+    },
+    {
+      "method": "cancel_order",
+      "params": {},
+      "expected": "order_guard",
+      "repeat": false,
+      "category": "交易禁用保护"
+    },
+    {
+      "method": "cancel_order_stock",
+      "params": {},
+      "expected": "order_guard",
+      "repeat": false,
+      "category": "交易禁用保护",
+      "alias_of": "cancel_order"
+    },
+    {
+      "method": "cancel_order_stock_sysid",
+      "params": {},
+      "expected": "order_guard",
+      "repeat": false,
+      "category": "交易禁用保护",
+      "alias_of": "cancel_order"
+    },
+    {
+      "method": "create_sector_folder",
+      "category": "行情与参考数据",
+      "skip": "没有已确认的目录删除接口，避免留下无法清理的测试目录"
+    },
+    {
+      "method": "datetime_to_timetag",
+      "category": "行情与参考数据",
+      "params": {
+        "datetime_str": "20260904150000",
+        "format": "%Y%m%d%H%M%S"
+      }
+    },
+    {
+      "method": "describe_trade_detail_fields",
+      "category": "账户与系统",
+      "params": {
+        "detail_types": [
+          "ACCOUNT",
+          "POSITION",
+          "ORDER",
+          "DEAL"
+        ]
+      }
+    },
+    {
+      "method": "download_cb_data",
+      "category": "有界数据下载",
+      "repeat": false,
+      "timeout": 30,
+      "params": {}
+    },
+    {
+      "method": "download_etf_info",
+      "category": "有界数据下载",
+      "repeat": false,
+      "timeout": 30,
+      "params": {}
+    },
+    {
+      "method": "download_financial_data",
+      "category": "有界数据下载",
+      "repeat": false,
+      "timeout": 30,
+      "params": {
+        "stock_list": [
+          "000001.SZ"
+        ],
+        "start_time": "20260101",
+        "end_time": "20260904",
+        "table_list": [
+          "Capital"
+        ]
+      }
+    },
+    {
+      "method": "download_financial_data2",
+      "category": "有界数据下载",
+      "repeat": false,
+      "timeout": 30,
+      "params": {
+        "stock_list": [
+          "000001.SZ"
+        ],
+        "start_time": "20260101",
+        "end_time": "20260904",
+        "table_list": [
+          "Capital"
+        ]
+      }
+    },
+    {
+      "method": "download_his_st_data",
+      "category": "行情与参考数据",
+      "skip": "接口没有股票或日期范围限制，未执行全市场历史 ST 下载"
+    },
+    {
+      "method": "download_history_contracts",
+      "category": "有界数据下载",
+      "repeat": false,
+      "timeout": 30,
+      "params": {}
+    },
+    {
+      "method": "download_history_data",
+      "category": "有界数据下载",
+      "repeat": false,
+      "timeout": 30,
+      "params": {
+        "stock_code": "000001.SZ",
+        "period": "1d",
+        "start_time": "20260901",
+        "end_time": "20260904"
+      }
+    },
+    {
+      "method": "download_history_data2",
+      "category": "有界数据下载",
+      "repeat": false,
+      "timeout": 30,
+      "params": {
+        "stock_list": [
+          "000001.SZ"
+        ],
+        "period": "1d",
+        "start_time": "20260901",
+        "end_time": "20260904"
+      }
+    },
+    {
+      "method": "download_holiday_data",
+      "category": "有界数据下载",
+      "repeat": false,
+      "timeout": 30,
+      "params": {}
+    },
+    {
+      "method": "download_index_weight",
+      "category": "有界数据下载",
+      "repeat": false,
+      "timeout": 30,
+      "params": {}
+    },
+    {
+      "method": "download_sector_data",
+      "category": "有界数据下载",
+      "repeat": false,
+      "timeout": 30,
+      "params": {}
+    },
+    {
+      "method": "gen_factor_index",
+      "category": "行情与参考数据",
+      "skip": "需要公式和新数据名称，未生成持久化因子数据"
+    },
+    {
+      "method": "getDividFactors",
+      "category": "MiniQMT 别名",
+      "params": {
+        "stock_code": "000001.SZ",
+        "start_time": "20260101",
+        "end_time": "20260904"
+      },
+      "alias_of": "get_divid_factors"
+    },
+    {
+      "method": "get_ETF_list",
+      "category": "行情与参考数据",
+      "params": {
+        "market": "SH",
+        "stock_code": "510050"
+      }
+    },
+    {
+      "method": "get_assure_contract",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "get_bvol",
+      "category": "行情与参考数据",
+      "params": {
+        "stock": "000001.SZ"
+      }
+    },
+    {
+      "method": "get_cb_info",
+      "category": "行情与参考数据",
+      "params": {
+        "stockcode": "113042.SH"
+      }
+    },
+    {
+      "method": "get_close_price",
+      "category": "行情与参考数据",
+      "params": {
+        "market": "SZ",
+        "stock_code": "000001",
+        "real_timetag": 1788505200000
+      }
+    },
+    {
+      "method": "get_closed_compacts",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "get_comb_option",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "get_contract_expire_date",
+      "category": "行情与参考数据",
+      "params": {
+        "stock": "IF2609.IF"
+      }
+    },
+    {
+      "method": "get_contract_multiplier",
+      "category": "行情与参考数据",
+      "params": {
+        "stockcode": "IF2609.IF"
+      }
+    },
+    {
+      "method": "get_date_location",
+      "category": "行情与参考数据",
+      "params": {
+        "date": "20260904"
+      }
+    },
+    {
+      "method": "get_debt_contract",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "get_divid_factors",
+      "category": "行情与参考数据",
+      "params": {
+        "stock_code": "000001.SZ",
+        "start_time": "20260101",
+        "end_time": "20260904"
+      }
+    },
+    {
+      "method": "get_download_status",
+      "category": "账户与系统",
+      "skip": "当前部署关闭异步下载队列，没有有效 job_id"
+    },
+    {
+      "method": "get_enable_short_contract",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "get_etf_info",
+      "category": "行情与参考数据",
+      "params": {}
+    },
+    {
+      "method": "get_factor_data",
+      "category": "行情与参考数据",
+      "params": {
+        "field_list": [
+          "pe_ttm"
+        ],
+        "stock_list": [
+          "000001.SZ"
+        ],
+        "start_date": "20260901",
+        "end_date": "20260904"
+      }
+    },
+    {
+      "method": "get_financial_data",
+      "category": "行情与参考数据",
+      "params": {
+        "stock_list": [
+          "000001.SZ"
+        ],
+        "table_list": [
+          "Capital"
+        ],
+        "start_time": "20260101",
+        "end_time": "20260904"
+      }
+    },
+    {
+      "method": "get_float_caps",
+      "category": "行情与参考数据",
+      "params": {
+        "stockcode": "000001.SZ"
+      }
+    },
+    {
+      "method": "get_formula_result",
+      "category": "行情与参考数据",
+      "skip": "未创建公式任务，没有有效 request_id"
+    },
+    {
+      "method": "get_his_contract_list",
+      "category": "行情与参考数据",
+      "params": {
+        "market": "IF"
+      }
+    },
+    {
+      "method": "get_his_index_data",
+      "category": "行情与参考数据",
+      "params": {
+        "stock_code": "000300.SH"
+      }
+    },
+    {
+      "method": "get_his_option_list",
+      "category": "行情与参考数据",
+      "params": {
+        "undl_code": "510050.SH",
+        "dedate": "202609"
+      }
+    },
+    {
+      "method": "get_his_option_list_batch",
+      "category": "行情与参考数据",
+      "params": {
+        "undl_code": "510050.SH",
+        "start_time": "20260901",
+        "end_time": "20260904"
+      }
+    },
+    {
+      "method": "get_his_st_data",
+      "category": "行情与参考数据",
+      "params": {
+        "stock_code": "000001.SZ"
+      }
+    },
+    {
+      "method": "get_history_trade_detail_data",
+      "category": "账户与系统",
+      "params": {
+        "detail_type": "DEAL",
+        "start_date": "20260901",
+        "end_date": "20260904"
+      }
+    },
+    {
+      "method": "get_hkt_details",
+      "category": "行情与参考数据",
+      "params": {
+        "stock_code": "00700.HK"
+      }
+    },
+    {
+      "method": "get_hkt_exchange_rate",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "get_hkt_statistics",
+      "category": "行情与参考数据",
+      "params": {
+        "stock_code": "00700.HK"
+      }
+    },
+    {
+      "method": "get_holder_num",
+      "category": "行情与参考数据",
+      "params": {
+        "stock_list": [
+          "000001.SZ"
+        ],
+        "start_time": "20260101",
+        "end_time": "20260904"
+      }
+    },
+    {
+      "method": "get_holidays",
+      "category": "行情与参考数据",
+      "params": {}
+    },
+    {
+      "method": "get_index_weight",
+      "category": "行情与参考数据",
+      "params": {
+        "index_code": "000300.SH"
+      }
+    },
+    {
+      "method": "get_industry",
+      "category": "行情与参考数据",
+      "params": {
+        "industry_name": "银行"
+      }
+    },
+    {
+      "method": "get_instrument",
+      "category": "账户与系统",
+      "params": {
+        "code": "000001.SZ"
+      }
+    },
+    {
+      "method": "get_instrument_detail",
+      "category": "MiniQMT 别名",
+      "params": {
+        "code": "000001.SZ"
+      },
+      "alias_of": "get_instrument"
+    },
+    {
+      "method": "get_instrument_type",
+      "category": "行情与参考数据",
+      "params": {
+        "code": "000001.SZ"
+      }
+    },
+    {
+      "method": "get_instrumentdetail",
+      "category": "MiniQMT 别名",
+      "params": {
+        "code": "000001.SZ"
+      },
+      "alias_of": "get_instrument"
+    },
+    {
+      "method": "get_ipo_data",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "get_ipo_info",
+      "category": "行情与参考数据",
+      "params": {}
+    },
+    {
+      "method": "get_l2_order",
+      "category": "行情与参考数据",
+      "params": {
+        "stock_code": "000001.SZ",
+        "count": 5,
+        "start_time": "20260904",
+        "end_time": "20260904"
+      }
+    },
+    {
+      "method": "get_l2_quote",
+      "category": "行情与参考数据",
+      "params": {
+        "stock_code": "000001.SZ",
+        "count": 5,
+        "start_time": "20260904",
+        "end_time": "20260904"
+      }
+    },
+    {
+      "method": "get_l2_transaction",
+      "category": "行情与参考数据",
+      "params": {
+        "stock_code": "000001.SZ",
+        "count": 5,
+        "start_time": "20260904",
+        "end_time": "20260904"
+      }
+    },
+    {
+      "method": "get_last_close",
+      "category": "行情与参考数据",
+      "params": {
+        "stock": "000001.SZ"
+      }
+    },
+    {
+      "method": "get_last_order_id",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "get_last_volume",
+      "category": "行情与参考数据",
+      "params": {
+        "stock": "000001.SZ"
+      }
+    },
+    {
+      "method": "get_local_data",
+      "category": "行情与参考数据",
+      "params": {
+        "field_list": [
+          "close"
+        ],
+        "stock_list": [
+          "000001.SZ"
+        ],
+        "period": "1d",
+        "count": 5,
+        "end_time": "20260904"
+      }
+    },
+    {
+      "method": "get_longhubang",
+      "category": "行情与参考数据",
+      "params": {
+        "stock_list": [
+          "000001.SZ"
+        ],
+        "start_time": "20260901",
+        "end_time": "20260904",
+        "count": 5
+      }
+    },
+    {
+      "method": "get_main_contract",
+      "category": "行情与参考数据",
+      "params": {
+        "code_market": "IF00.IF"
+      }
+    },
+    {
+      "method": "get_market_data",
+      "category": "行情与参考数据",
+      "params": {
+        "field_list": [
+          "close"
+        ],
+        "stock_list": [
+          "000001.SZ"
+        ],
+        "period": "1d",
+        "count": 5,
+        "end_time": "20260904"
+      }
+    },
+    {
+      "method": "get_market_data_ex",
+      "category": "行情与参考数据",
+      "params": {
+        "field_list": [
+          "close"
+        ],
+        "stock_list": [
+          "000001.SZ"
+        ],
+        "period": "1d",
+        "count": 5,
+        "end_time": "20260904"
+      }
+    },
+    {
+      "method": "get_market_last_trade_date",
+      "category": "行情与参考数据",
+      "params": {
+        "market": "SH"
+      }
+    },
+    {
+      "method": "get_markets",
+      "category": "行情与参考数据",
+      "params": {}
+    },
+    {
+      "method": "get_new_purchase_limit",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "get_north_finance_change",
+      "category": "行情与参考数据",
+      "params": {
+        "period": "1d"
+      }
+    },
+    {
+      "method": "get_open_date",
+      "category": "行情与参考数据",
+      "params": {
+        "stock": "000001.SZ"
+      }
+    },
+    {
+      "method": "get_option_detail_data",
+      "category": "行情与参考数据",
+      "params": {
+        "stockcode": "$OPTION"
+      }
+    },
+    {
+      "method": "get_option_iv",
+      "category": "行情与参考数据",
+      "params": {
+        "opt_code": "$OPTION"
+      }
+    },
+    {
+      "method": "get_option_subject_position",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "get_option_undl",
+      "category": "行情与参考数据",
+      "params": {
+        "opt_code": "$OPTION"
+      }
+    },
+    {
+      "method": "get_option_undl_data",
+      "category": "行情与参考数据",
+      "params": {
+        "undl_code_ref": "510050.SH"
+      }
+    },
+    {
+      "method": "get_position_statistics",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "get_raw_financial_data",
+      "category": "行情与参考数据",
+      "params": {
+        "field_list": [
+          "CAPITALSTRUCTURE.total_capital"
+        ],
+        "stock_list": [
+          "000001.SZ"
+        ],
+        "start_time": "20260101",
+        "end_time": "20260904"
+      }
+    },
+    {
+      "method": "get_risk_free_rate",
+      "category": "行情与参考数据",
+      "params": {}
+    },
+    {
+      "method": "get_sector_info",
+      "category": "行情与参考数据",
+      "params": {}
+    },
+    {
+      "method": "get_sector_list",
+      "category": "行情与参考数据",
+      "params": {}
+    },
+    {
+      "method": "get_stock_name",
+      "category": "行情与参考数据",
+      "params": {
+        "stock": "000001.SZ"
+      }
+    },
+    {
+      "method": "get_stock_type",
+      "category": "行情与参考数据",
+      "params": {
+        "stock": "000001.SZ"
+      }
+    },
+    {
+      "method": "get_svol",
+      "category": "行情与参考数据",
+      "params": {
+        "stock": "000001.SZ"
+      }
+    },
+    {
+      "method": "get_top10_share_holder",
+      "category": "行情与参考数据",
+      "params": {
+        "stock_list": [
+          "000001.SZ"
+        ],
+        "data_name": "holder",
+        "start_time": "20260101",
+        "end_time": "20260904"
+      }
+    },
+    {
+      "method": "get_total_share",
+      "category": "行情与参考数据",
+      "params": {
+        "stockcode": "000001.SZ"
+      }
+    },
+    {
+      "method": "get_trade_times",
+      "category": "行情与参考数据",
+      "params": {
+        "stockcode": "000001.SZ"
+      }
+    },
+    {
+      "method": "get_trading_calendar",
+      "category": "行情与参考数据",
+      "params": {
+        "market": "SH",
+        "start_time": "20260901",
+        "end_time": "20260904"
+      }
+    },
+    {
+      "method": "get_trading_dates",
+      "category": "行情与参考数据",
+      "params": {
+        "market": "SH",
+        "start_time": "20260901",
+        "end_time": "20260904",
+        "count": 5
+      }
+    },
+    {
+      "method": "get_turn_over_rate",
+      "category": "行情与参考数据",
+      "params": {
+        "stockcode": "000001.SZ"
+      }
+    },
+    {
+      "method": "get_turnover_rate",
+      "category": "行情与参考数据",
+      "params": {
+        "stock_code": [
+          "000001.SZ"
+        ],
+        "start_time": "20260901",
+        "end_time": "20260904"
+      }
+    },
+    {
+      "method": "get_unclosed_compacts",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "get_value_by_order_id",
+      "category": "账户与系统",
+      "params": {
+        "order_id": "BIGQMT_TEST_NONEXISTENT"
+      }
+    },
+    {
+      "method": "get_weight_in_index",
+      "category": "行情与参考数据",
+      "params": {
+        "mtkindexcode": "000300.SH",
+        "stockcode": "000001.SZ"
+      }
+    },
+    {
+      "method": "is_stock_type",
+      "category": "行情与参考数据",
+      "params": {
+        "stock": "000001.SZ",
+        "tag": "stock"
+      }
+    },
+    {
+      "method": "order_stock",
+      "params": {},
+      "expected": "order_guard",
+      "repeat": false,
+      "category": "交易禁用保护",
+      "alias_of": "submit_order"
+    },
+    {
+      "method": "order_stock_async",
+      "params": {},
+      "expected": "order_guard",
+      "repeat": false,
+      "category": "交易禁用保护",
+      "alias_of": "submit_order"
+    },
+    {
+      "method": "order_stock_batch",
+      "params": {},
+      "expected": "order_guard",
+      "repeat": false,
+      "category": "交易禁用保护",
+      "alias_of": "submit_orders_batch"
+    },
+    {
+      "method": "passorder",
+      "params": {},
+      "expected": "order_guard",
+      "repeat": false,
+      "category": "交易禁用保护"
+    },
+    {
+      "method": "probe_order_identity",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "query_account_infos",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "query_account_status",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "query_appointment_info",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "query_credit_assure",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "query_credit_detail",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "query_credit_slo_code",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "query_credit_subjects",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "query_execution_snapshot",
+      "category": "账户与系统",
+      "params": {
+        "order_strategy_name": "",
+        "trade_strategy_name": ""
+      }
+    },
+    {
+      "method": "query_position_statistics",
+      "category": "MiniQMT 别名",
+      "params": {},
+      "alias_of": "get_position_statistics"
+    },
+    {
+      "method": "query_smt_secu_info",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "query_smt_secu_rate",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "query_stk_compacts",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "query_stock_asset",
+      "category": "MiniQMT 别名",
+      "params": {},
+      "alias_of": "get_asset"
+    },
+    {
+      "method": "query_stock_orders",
+      "category": "MiniQMT 别名",
+      "params": {
+        "strategy_name": ""
+      },
+      "alias_of": "query_orders"
+    },
+    {
+      "method": "query_stock_position",
+      "category": "账户与系统",
+      "params": {
+        "stock_code": "000001.SZ"
+      }
+    },
+    {
+      "method": "query_stock_positions",
+      "category": "MiniQMT 别名",
+      "params": {},
+      "alias_of": "get_positions"
+    },
+    {
+      "method": "query_stock_trades",
+      "category": "MiniQMT 别名",
+      "params": {
+        "strategy_name": ""
+      },
+      "alias_of": "query_trades"
+    },
+    {
+      "method": "quote_keepalive",
+      "category": "账户与系统",
+      "skip": "在订阅生命周期测试中以本测试会话标识验证"
+    },
+    {
+      "method": "reload_deployment",
+      "category": "账户与系统",
+      "skip": "本轮保持正在运行的 QMT 实例；重载路径由离线回归覆盖"
+    },
+    {
+      "method": "reload_status",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "smt_appointment",
+      "category": "账户与系统",
+      "params": {}
+    },
+    {
+      "method": "submit_download_history_data",
+      "category": "关闭功能保护",
+      "expected": "download_disabled",
+      "repeat": false,
+      "params": {
+        "stock_code": "000001.SZ",
+        "period": "1d",
+        "start_time": "20260901",
+        "end_time": "20260904"
+      }
+    },
+    {
+      "method": "submit_download_history_data2",
+      "category": "关闭功能保护",
+      "expected": "download_disabled",
+      "repeat": false,
+      "params": {
+        "stock_list": [
+          "000001.SZ"
+        ],
+        "period": "1d",
+        "start_time": "20260901",
+        "end_time": "20260904"
+      }
+    },
+    {
+      "method": "submit_order",
+      "params": {},
+      "expected": "order_guard",
+      "repeat": false,
+      "category": "交易禁用保护"
+    },
+    {
+      "method": "submit_orders_batch",
+      "params": {},
+      "expected": "order_guard",
+      "repeat": false,
+      "category": "交易禁用保护"
+    },
+    {
+      "method": "subscribe_formula",
+      "category": "行情与参考数据",
+      "skip": "缺少已确认的公式样本；不能把拒绝未知公式视为订阅可用"
+    },
+    {
+      "method": "subscribe_l2thousand",
+      "category": "行情与参考数据",
+      "skip": "该接口没有配套的 RPC 退订句柄；L2 读取接口另行测试"
+    },
+    {
+      "method": "subscribe_whole_quote",
+      "category": "账户与系统",
+      "skip": "在订阅生命周期测试中验证"
+    },
+    {
+      "method": "sync_positions",
+      "category": "本轮临时板块与快照同步",
+      "repeat": false,
+      "params": {}
+    },
+    {
+      "method": "timetag_to_datetime",
+      "category": "行情与参考数据",
+      "params": {
+        "timetag": 1788505200000,
+        "format": "%Y%m%d%H%M%S"
+      }
+    },
+    {
+      "method": "unsubscribe_formula",
+      "category": "行情与参考数据",
+      "skip": "未创建公式订阅，不操作其他策略的订阅"
+    },
+    {
+      "method": "unsubscribe_whole_quote",
+      "category": "账户与系统",
+      "skip": "在订阅生命周期测试中验证"
+    },
+    {
+      "method": "wait_download",
+      "category": "账户与系统",
+      "skip": "当前部署关闭异步下载队列，没有有效 job_id"
+    },
+    {
+      "method": "create_sector",
+      "category": "本轮临时板块与快照同步",
+      "repeat": false,
+      "params": {
+        "sector_name": "$SECTOR",
+        "stock_list": [
+          "000001.SZ"
+        ]
+      }
+    },
+    {
+      "method": "add_stock_to_sector",
+      "category": "本轮临时板块与快照同步",
+      "repeat": false,
+      "params": {
+        "sector": "$SECTOR",
+        "stock_code": "600000.SH"
+      }
+    },
+    {
+      "method": "remove_stock_from_sector",
+      "category": "本轮临时板块与快照同步",
+      "repeat": false,
+      "params": {
+        "sector": "$SECTOR",
+        "stock_code": "600000.SH"
+      }
+    },
+    {
+      "method": "reset_sector_stock_list",
+      "category": "本轮临时板块与快照同步",
+      "repeat": false,
+      "params": {
+        "sector": "$SECTOR",
+        "stock_list": [
+          "000001.SZ",
+          "600000.SH"
+        ]
+      }
+    },
+    {
+      "method": "add_sector",
+      "category": "本轮临时板块与快照同步",
+      "repeat": false,
+      "params": {
+        "sector_name": "$SECTOR",
+        "stock_list": [
+          "000001.SZ"
+        ]
+      }
+    },
+    {
+      "method": "remove_sector",
+      "category": "本轮临时板块与快照同步",
+      "repeat": false,
+      "params": {
+        "sector_name": "$SECTOR"
+      }
+    }
+  ],
+  "canonical_count": 141,
+  "alias_count": 14
+}
