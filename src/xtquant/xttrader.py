@@ -1,7 +1,7 @@
 from bigqmt_signal_trader.xtquant_compat import (
     BigQmtXtTrader,
-    XtQuantTrader,
     XtQuantTraderCallback,
 )
+from bigqmt_signal_trader.sdk_trader import XtQuantTrader
 
 __all__ = ["BigQmtXtTrader", "XtQuantTrader", "XtQuantTraderCallback"]

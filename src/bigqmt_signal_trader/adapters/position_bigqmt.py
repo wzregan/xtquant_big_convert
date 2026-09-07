@@ -154,13 +154,15 @@ class BigQmtPositionProvider:
             raise RuntimeError("get_trade_detail_data is not available in Big QMT runtime")
         return self.get_trade_detail_data
 
-    def get_positions(self, account_id):
+    def get_positions(self, account_id, strict=False):
+        """读取持仓；strict 为真时拒绝查询失败或无法解析的行，供完整对账使用。"""
         query = self._require_query_func()
-        # QMT's get_trade_detail_data can raise on POSITION queries in some
-        # states (e.g. context not bound). Degrade to empty like get_asset does.
+        # 上下文未绑定等状态会使原生查询抛错；旧入口保留空结果行为，严格入口必须暴露失败。
         try:
             rows = query(account_id, self._resolve_account_type(account_id), "POSITION") or []
         except Exception:
+            if strict:
+                raise
             return {}
         positions = {}
         for row in rows:
@@ -170,6 +172,8 @@ class BigQmtPositionProvider:
                     _attr(row, ("m_strExchangeID", "exchange_id", "market")),
                 )
             except Exception as exc:
+                if strict:
+                    raise
                 skip_unparsable_row("POSITION", row, exc)
                 continue
             positions[code] = PositionSnapshot(
@@ -187,6 +191,10 @@ class BigQmtPositionProvider:
                 direction=int(_attr(row, ("m_nDirection", "direction"), 48) or 48),
             )
         return positions
+
+    def get_positions_strict(self, account_id):
+        """返回完整持仓快照，禁止将失败查询或缺失行转换成空仓。"""
+        return self.get_positions(account_id, strict=True)
 
     def get_position_statistics(self, account_id):
         query = self._require_query_func()

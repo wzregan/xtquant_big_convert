@@ -24,6 +24,8 @@ import json
 import os
 import sys
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -31,7 +33,7 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from bigqmt_signal_trader.redis_rpc import (
     TYPED_PAYLOAD_FLAG, TYPED_PAYLOAD_MARKER, loads_rpc_response, to_jsonable)
-from bigqmt_signal_trader.xtquant_compat import _restore_jsonable
+from bigqmt_signal_trader.xtquant_compat import BigQmtRpcClient, _restore_jsonable
 
 
 FRAME = {"__bigqmt_type__": "DataFrame", "columns": ["a"], "records": [{"a": 1}]}
@@ -121,13 +123,24 @@ class FlagHygieneTest(unittest.TestCase):
         self.assertNotIn(TYPED_PAYLOAD_FLAG, response["data"])
 
     def test_the_client_pops_it(self):
-        """It must not reach the caller as part of the response."""
-        import io
-        path = os.path.join(ROOT, "src", "bigqmt_signal_trader", "xtquant_compat.py")
-        with io.open(path, encoding="utf-8") as handle:
-            source = handle.read()
-
-        self.assertIn("response.pop(TYPED_PAYLOAD_FLAG, None) is False", source)
+        """实际验证标志不泄露、普通行情跳过重建；不依赖源码中分支的写法。"""
+        for flag in (False, True, None):
+            with self.subTest(flag=flag):
+                response = {"ok": True, "data": TICKS}
+                if flag is not None:
+                    response[TYPED_PAYLOAD_FLAG] = flag
+                client = BigQmtRpcClient(account_id="acct")
+                client._transport_instance = SimpleNamespace(send_request=Mock(return_value=response))
+                with patch("bigqmt_signal_trader.xtquant_compat._restore_jsonable",
+                           wraps=_restore_jsonable) as restore:
+                    data = client.call("get_full_tick", use_formula=False)
+                    self.assertEqual(data, TICKS)
+                    self.assertNotIn(TYPED_PAYLOAD_FLAG, data)
+                    self.assertNotIn(TYPED_PAYLOAD_FLAG, response)
+                    if flag is False:
+                        restore.assert_not_called()
+                    else:
+                        restore.assert_called()
 
     def test_an_absent_flag_means_walk(self):
         """In-process routing never sees the text. Assuming "nothing to do"

@@ -983,6 +983,8 @@ class BigQmtRpcClient:
                 return result
             except Unroutable:
                 pass
+        # 只有成功的真实桥接 RPC 可以续期连接凭据；本地缓存及 FormulaServer 不算。
+        self._last_rpc_success_monotonic = 0.0
         transport = self._transport()
         if transport is not None:
             # Swappable transport path (zmq/mysql/...). Build the request
@@ -1008,7 +1010,8 @@ class BigQmtRpcClient:
             )
         if not response.get("ok"):
             raise RpcServerRepliedError(
-                response.get("error") or "Big QMT RPC failed: %s" % method)
+                response.get("error") or "Big QMT RPC failed: %s" % method,
+                error_code=response.get("error_code", ""))
         # server_error 携带 QMT 端诊断（如 passorder 提交但委托没进系统）。
         # 只在交易类方法上设置（读取类恒为空），转成异常让调用方看到真实原因，
         # 而不是把「无委托号」误判为 -1 失败（issue #38）。
@@ -1020,9 +1023,11 @@ class BigQmtRpcClient:
         # it found none there is provably nothing to rebuild, and skipping the
         # walk turns 345.9ms into 3.7ms on a 51285-instrument snapshot. A None
         # flag means the text was never seen (in-process routing), so walk.
-        if response.pop(TYPED_PAYLOAD_FLAG, None) is False:
-            return response.get("data")
-        return _restore_jsonable(response.get("data"))
+        data = response.get("data")
+        if response.pop(TYPED_PAYLOAD_FLAG, None) is not False:
+            data = _restore_jsonable(data)
+        self._last_rpc_success_monotonic = time.monotonic()
+        return data
 
     # ------------------------------------------------------------------
     # Async RPC (issue #63): call_async returns a Future immediately, so a
@@ -1193,6 +1198,11 @@ class RpcServerRepliedError(RuntimeError):
     is safe. A timeout means the batch may still be running and retrying
     doubles orders."""
 
+    def __init__(self, message, error_code=""):
+        """保存服务端明确错误码；仅 EXECUTION_NOT_STARTED 可证明没有进入原生下单。"""
+        super(RpcServerRepliedError, self).__init__(message)
+        self.error_code = error_code
+
 
 
 
@@ -1304,7 +1314,7 @@ class _BarPoller(object):
 
     @staticmethod
     def _signature(data):
-        """Identify the newest bar cheaply, without assuming a container type."""
+        """比较最后一根的时间和内容，盘中同一根 K 线价格、成交量变化也必须通知。"""
         try:
             for value in (data or {}).values():
                 if value is None:
@@ -1312,7 +1322,8 @@ class _BarPoller(object):
                 if hasattr(value, "empty"):          # pandas DataFrame
                     if getattr(value, "empty", True):
                         continue
-                    return str(value.index[-1]), int(len(value))
+                    return (str(value.index[-1]), int(len(value)),
+                            tuple((str(key), repr(item)) for key, item in value.iloc[-1].items()))
                 if isinstance(value, (list, tuple)) and value:
                     return repr(value[-1]), len(value)
                 if isinstance(value, dict) and value:
@@ -1339,7 +1350,8 @@ class _BarPoller(object):
                 elif signature != self._last_signature:
                     self._reported_no_data = False
                     self._last_signature = signature
-                    if self._callback is not None:
+                    # 退订可能发生在原生查询等待期间；返回后禁止再交付这一迟到结果。
+                    if self._callback is not None and not self._stop.is_set():
                         self._callback(data)
             except Exception as exc:
                 if self._on_error is not None:
@@ -1401,6 +1413,45 @@ class BigQmtXtData:
         self._quote_session_factory = None  # test hook: returns a session-like object
         self._bar_pollers = {}              # seq -> _BarPoller, for K-line periods
         self._bar_poller_lock = threading.Lock()
+        self._connection_lock = threading.RLock()
+        self._connected_until = 0.0
+
+    def connect(self, ip="", port=None, remember_if_success=True):
+        """探测桥接连接；一秒内复用探测或真实 RPC 成功记录，避免逐请求重复往返。
+
+        ip/port 属于原生 XtData 服务参数；桥接端点由 BIGQMT 的 RPC 配置管理。
+        显式传入原生端点时拒绝连接，避免把 VIP 连接静默改成另一数据源。
+        """
+        if ip or port not in (None, 0):
+            raise NotImplementedError("configure the BigQMT RPC endpoint instead of xtdata port")
+        with self._connection_lock:
+            last_success = getattr(self.client, "_last_rpc_success_monotonic", 0.0)
+            recent_rpc_until = last_success + 1.0 if last_success > 0 else 0.0
+            if time.monotonic() < max(self._connected_until, recent_rpc_until):
+                return True
+            self._connected_until = 0.0
+            pong = self.client.call("ping")
+            if not isinstance(pong, dict) or pong.get("pong") is not True:
+                self.client._last_rpc_success_monotonic = 0.0
+                raise ConnectionError("invalid BigQMT ping response")
+            self._connected_until = time.monotonic() + 1.0
+            return True
+
+    def disconnect(self):
+        """停止本行情对象的订阅并清除连接状态；交易对象拥有独立客户端。"""
+        with self._connection_lock:
+            self._connected_until = 0.0
+            self.client._last_rpc_success_monotonic = 0.0
+            self.stop_all_subscriptions()
+            session = self._quote_session
+            if session is not None:
+                session.close()
+                self._quote_session = None
+            transport = getattr(self.client, "_transport_instance", None)
+            stop = getattr(transport, "stop", None)
+            if callable(stop):
+                stop()
+                self.client._transport_instance = None
 
     def _next_seq(self):
         self._subscribe_seq += 1
@@ -1421,7 +1472,11 @@ class BigQmtXtData:
 
     def _call(self, method, timeout_seconds=None, **params):
         """转发行情请求；timeout_seconds 是客户端等待秒数，不属于服务端业务参数。"""
-        return self.client.call(method, params, timeout_seconds=timeout_seconds)
+        try:
+            return self.client.call(method, params, timeout_seconds=timeout_seconds)
+        except Exception:
+            self._connected_until = 0.0
+            raise
 
     def get_full_tick(self, code_list, timeout_seconds=None, types=None):
         """Fetch full tick data for a list of codes.
@@ -1589,7 +1644,37 @@ class BigQmtXtData:
         return self.client.call("get_deployment_info", {}) or {}
 
     def get_instrument_detail(self, stock_code):
+        """读取当前单证券详情，保持原生单项接口的新鲜度。"""
         return self.client.call("get_instrument_detail", {"code": stock_code}) or {}
+
+    def get_instrument_details(self, code_list):
+        """批量详情扩展：最多五百个代码，按代码返回本次详情或空值，不缓存状态。"""
+        codes = list(code_list)
+        if len(codes) > 500:
+            raise ValueError("code_list must contain at most 500 instruments")
+        if not codes:
+            return {}
+        try:
+            result = self._call("get_instruments", codes=codes)
+        except RpcServerRepliedError as exc:
+            # 允许新客户端连接旧桥接服务；仅明确缺少此方法时退回原单项接口。
+            message = str(exc)
+            if message.startswith("ValueError: "):
+                message = message[len("ValueError: "):]
+            if message not in (
+                "rpc method is not allowed: get_instruments",
+                "rpc method is not implemented: get_instruments",
+            ):
+                raise
+            result = {}
+            for code in dict.fromkeys(codes):
+                try:
+                    result[code] = self.get_instrument_detail(code)
+                except Exception:
+                    result[code] = None
+        if not isinstance(result, dict):
+            raise ValueError("invalid get_instruments response")
+        return result
 
     def get_instrumentdetail(self, stock_code):
         return self.get_instrument_detail(stock_code)
@@ -3705,6 +3790,10 @@ class BigQmtXtTrader:
                 return remembered
         return order_sys_id_of(value)
 
+    def _order_rpc_params(self, params):
+        """为标准 SDK 子类提供执行契约入口，直接桥接调用保持原参数。"""
+        return params
+
     def order_stock_result(
         self, account, stock_code, order_type, order_volume, price_type,
         price, strategy_name="", order_remark="", wait_settlement=True,
@@ -3726,6 +3815,7 @@ class BigQmtXtTrader:
         }
         if not wait_settlement:
             payload["wait_settlement"] = False
+        payload = self._order_rpc_params(payload)
         try:
             return self.client.call("order_stock", payload, account_id=account_id) or {}
         except TimeoutError as exc:
@@ -4171,12 +4261,15 @@ class BigQmtXtTrader:
     def _enqueue_async_outcome(self, unit):
         self._async_callback_queue.put(unit)
 
-    def _fire_async_outcome(self, unit):
-        """One job's callback, on the dispatcher thread.
+    def _async_response_order_id(self, order_sys_id, user_order_id):
+        """保留直接桥接入口的临时编号约定，标准 SDK 子类可要求真实合同号。"""
+        return self._order_object_id(order_sys_id or user_order_id)
 
-        The barrier release rides in the same unit AFTER the user callback, so
-        the #51 contract -- a委托's async_response before its held order/trade
-        events -- is unchanged from when everything ran on one thread.
+    def _fire_async_outcome(self, unit):
+        """在回调分发线程交付 unit 中的一项异步结果。
+
+        用户回调完成后才释放同一委托的事件屏障，保持异步响应先于委托、成交回调。
+        暂缺合同号的标准 SDK 响应明确保留未确认身份，避免备注被误用作委托号。
         """
         callback = self.callback
         seq = unit["seq"]
@@ -4217,17 +4310,18 @@ class BigQmtXtTrader:
                             order_sys_id = learned
                             break
                         time.sleep(0.05)
+                response_id = self._async_response_order_id(order_sys_id, unit["user_order_id"])
                 callback.on_order_stock_async_response(
                     CompatObject(
                         account_id=self.client.account_id,
                         seq=seq,
-                        order_id=self._order_object_id(order_sys_id or unit["user_order_id"]),
+                        order_id=response_id,
                         order_sysid=order_sys_id,    # MiniQMT 规范名 (issue #65)
                         order_sys_id=order_sys_id,
                         stock_code=unit["stock_code"],
                         strategy_name=unit["strategy_name"],
                         order_remark=unit["order_remark"],
-                        error_msg="",
+                        error_msg="" if response_id else "order identity pending; query before retrying",
                     ),
                 )
         except Exception:
@@ -4307,7 +4401,7 @@ class BigQmtXtTrader:
         for item in orders or []:
             entry = dict(item or {})
             entry.setdefault("account_id", account_id)
-            payload.append(entry)
+            payload.append(self._order_rpc_params(entry))
         params = {"account_id": account_id, "orders": payload}
         if not idempotent:
             params["idempotent"] = False

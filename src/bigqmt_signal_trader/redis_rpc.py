@@ -37,6 +37,7 @@ READ_METHODS = {
     "probe_order_identity",
     "get_ticks",
     "get_instrument",
+    "get_instruments",
     "get_instrument_type",
     "get_market_data",
     "get_market_data_ex",
@@ -130,6 +131,8 @@ QUOTE_SUBSCRIPTION_METHODS = {
 }
 
 LISTENER_DEFERRED_METHODS = {
+    # 批量详情仍在策略线程逐项调用原生 API，只合并传输，不能移到监听线程。
+    "get_instruments",
     "sync_positions",
     # Trade-context queries route through QMT's get_trade_detail_data, which
     # returns EMPTY when called from the background RPC thread (it needs the main
@@ -523,6 +526,7 @@ class BigQmtRpcHandlers:
         # QMT runtime-injected global functions (passorder/get_trade_detail_data/
         # 融资融券查询等)。由 strategy._build_config 解析注入。
         self.qmt_api = dict(qmt_api or {})
+        self._sdk_generation = uuid.uuid4().hex
         self._submit_journal = {}
         # In-process order-identity journal: remark -> strategy_name, written
         # at submit time and read back at query time. The Redis identity store
@@ -591,6 +595,8 @@ class BigQmtRpcHandlers:
             "account_id": self.account_id,
             "allow_order_methods": bool(self.allow_order_methods),
             "rpc_revision": RPC_REVISION,
+            "sdk_capabilities": ["execution_context_v1", "account_status_v1"],
+            "generation": self._sdk_generation,
             "version": _deployed_version(),
             "account_type": self._reported_account_type(
                 params.get("account_id") or self.account_id),
@@ -1040,6 +1046,22 @@ class BigQmtRpcHandlers:
             raise ValueError("code is required")
         return self.market_data.get_instrument(code)
 
+    def _handle_get_instruments(self, params):
+        """在当前策略线程批量读取详情；codes 最多五百项，失败项保留为空。"""
+        codes = params.get("codes")
+        if not isinstance(codes, (list, tuple)) or len(codes) > 500:
+            raise ValueError("codes must be a list of at most 500 instruments")
+        if any(not isinstance(code, str) or not code.strip() for code in codes):
+            raise ValueError("codes must contain non-empty strings")
+        result = {}
+        for code in dict.fromkeys(codes):
+            try:
+                result[code] = self.market_data.get_instrument(code)
+            except Exception:
+                # 某只证券详情不可用时，不能丢掉同批其它证券的明确状态。
+                result[code] = None
+        return result
+
     def _handle_market_data_method(self, method, params):
         handler = getattr(self.market_data, method, None)
         if handler is None:
@@ -1047,7 +1069,11 @@ class BigQmtRpcHandlers:
         return handler(**dict(params or {}))
 
     def _handle_get_positions(self, params):
-        return self.position_provider.get_positions(self._request_account_id(params))
+        """使用严格持仓查询，防止对账把查询异常当作已经清仓。"""
+        query = getattr(self.position_provider, "get_positions_strict", None)
+        if not callable(query):
+            query = self.position_provider.get_positions
+        return query(self._request_account_id(params))
 
     def _handle_get_position_statistics(self, params):
         return self.position_provider.get_position_statistics(self._request_account_id(params))
@@ -1064,13 +1090,17 @@ class BigQmtRpcHandlers:
         return self.position_provider.get_asset(self._request_account_id(params))
 
     def _handle_query_orders(self, params):
+        """读取委托快照；原生查询失败必须作为 RPC 错误返回，不能伪装为无委托。"""
         if self.order_gateway is None:
             raise RuntimeError("order_gateway is not configured")
         # strategy_name filters orders by the name used in passorder. An empty
         # string returns ALL orders for the account (verified via diagnostic:
         # st="" -> 9 orders, st="bigqmt_signal_trader" -> 0). Default to ""
         # so callers see every order unless they explicitly filter.
-        orders = self.order_gateway.query_orders(
+        query = getattr(self.order_gateway, "query_orders_strict", None)
+        if not callable(query):
+            query = self.order_gateway.query_orders
+        orders = query(
             self._request_account_id(params),
             str(params.get("strategy_name") or ""),
         )
@@ -1084,6 +1114,7 @@ class BigQmtRpcHandlers:
             self._request_account_id(params), orders)
 
     def _handle_query_trades(self, params):
+        """读取成交快照，保持柜台无成交和查询失败两种事实的区别。"""
         if self.order_gateway is None:
             raise RuntimeError("order_gateway is not configured")
         # Empty strategy_name returns ALL deals for the account (see query_orders
@@ -1092,9 +1123,12 @@ class BigQmtRpcHandlers:
         if strategy_name is None:
             strategy_name = ""
         account_id = self._request_account_id(params)
+        query = getattr(self.order_gateway, "query_trades_strict", None)
+        if not callable(query):
+            query = self.order_gateway.query_trades
         return self._attribute_to_strategies(
             account_id,
-            self.order_gateway.query_trades(account_id, str(strategy_name)),
+            query(account_id, str(strategy_name)),
         )
 
     def _attribute_to_strategies(self, account_id, snapshots):
@@ -1345,8 +1379,23 @@ class BigQmtRpcHandlers:
         return self._query_trade_detail(params, "ACCOUNT")
 
     def _handle_query_account_status(self, params):
-        # 账户状态 — 用 TASK detail type 近似（委托任务状态）
-        return self._query_trade_detail(params, "TASK")
+        """查询 ACCOUNT 的真实状态字段；查询失败与真实空列表必须区分。"""
+        from .sdk_contract import account_status_row
+
+        account_id = self._request_account_id(params)
+        account_type = self._configured_account_type(account_id)
+        query = getattr(self.order_gateway, "get_trade_detail_data", None)
+        query = query or self.qmt_api.get("get_trade_detail_data")
+        if not callable(query):
+            raise NotImplementedError("get_trade_detail_data ACCOUNT is unavailable")
+        rows = _normalize_detail_rows(query(account_id, account_type, "ACCOUNT", ""))
+        type_code = {"STOCK": 2, "CREDIT": 3, "FUTURE": 1}.get(account_type, 0)
+        result = []
+        for row in rows:
+            status = account_status_row(row, account_id, type_code)
+            status["generation"] = self._sdk_generation
+            result.append(status)
+        return result
 
     def _handle_query_credit_detail(self, params):
         # 融资融券账户明细 — 官方独立函数 get_debt_contract
@@ -1670,6 +1719,7 @@ class BigQmtRpcHandlers:
     _credit_order_type_from_params = _forwarded_order_type
 
     def _handle_submit_order(self, params):
+        """提交委托；携带执行契约时在 QMT 原生调用前再次核验。"""
         if self.order_gateway is None:
             raise RuntimeError("order_gateway is not configured")
         price = params.get("price")
@@ -1696,6 +1746,26 @@ class BigQmtRpcHandlers:
             raise ValueError("stock_code is required")
         if request.volume <= 0:
             raise ValueError("volume must be positive")
+
+        context = params.get("execution_context")
+        if context is not None:
+            from .sdk_contract import ExecutionRejected, check_execution_context
+
+            def check_submission():
+                """排队和账户查询均结束后复查期限，拒绝迟到执行。"""
+                check_execution_context(context)
+                if context.get("generation", self._sdk_generation) != self._sdk_generation:
+                    raise ExecutionRejected("STALE_DEPLOYMENT_GENERATION")
+                statuses = self._handle_query_account_status({"account_id": request.account_id})
+                if len(statuses) != 1 or statuses[0]["status"] != 0:
+                    raise ExecutionRejected("ACCOUNT_NOT_READY")
+                if not self.allow_order_methods:
+                    raise ExecutionRejected("TRADING_UNAVAILABLE_BEFORE_SUBMISSION")
+                check_execution_context(context)
+
+            # 检查必须靠近 passorder，不能仅在 RPC 收包或构造请求时执行。
+            request.submission_guard = check_submission
+            check_submission()
 
         try:
             from .exec_events import remember_order_identity
@@ -2742,6 +2812,7 @@ class RedisPubSubRpcService:
                 return response
         except Exception as exc:
             response["error"] = "%s: %s" % (exc.__class__.__name__, exc)
+            response["error_code"] = getattr(exc, "error_code", "")
         response["_t_reply"] = time.time()
         _t_pub0 = time.perf_counter() if method == "ping" else 0.0
         try:

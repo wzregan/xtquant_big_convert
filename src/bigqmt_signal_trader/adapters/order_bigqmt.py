@@ -114,7 +114,8 @@ ACCOUNT_TYPE_CODES = _account_type_codes()
 
 
 def _first_nonzero(row, names, default=0.0):
-    """First candidate attribute with a non-zero numeric value."""
+    """优先读取非零数字，全部为零时保留零，字段全部缺失时返回 default。"""
+    present = False
     for name in names:
         value = getattr(row, name, None)
         if value is None:
@@ -123,9 +124,10 @@ def _first_nonzero(row, names, default=0.0):
             number = float(value)
         except (TypeError, ValueError):
             continue
+        present = True
         if number:
             return number
-    return default
+    return 0.0 if present else default
 
 
 # 报单来源 last -- see exec_events._STRATEGY_NAME_FIELDS for why it belongs
@@ -511,6 +513,7 @@ class BigQmtOrderGateway:
         return "bq:%s:%s" % (digest, text[:30])
 
     def submit(self, request):
+        """将委托转换为原生参数，并在实际报单前调用可选执行检查。"""
         passorder = self._require_passorder()
         action = str(request.action).upper()
         raw_order_type = getattr(request, "order_type", None)
@@ -548,6 +551,9 @@ class BigQmtOrderGateway:
 
         user_order_id = str(request.remark or "").strip() or self.build_user_order_id(request.signal_id)
         account_id = request.account_id or self.account_id
+        guard = getattr(request, "submission_guard", None)
+        if guard is not None:
+            guard()
         passorder(
             op_type,
             self.combo_type,
@@ -791,12 +797,10 @@ class BigQmtOrderGateway:
                     instrument_name=self._instrument_name(row, stock_code, name_cache),
                     secu_account=str(_attr(row, ("m_strShareholderID", "m_strSecuAccount",
                                                  "secu_account"), "") or ""),
-                    # XtTrade.commission 手续费. A live DEAL row carries BOTH
-                    # m_dComssion (QMT's own misspelling) and m_dCommission, so
-                    # first-non-None would stop at whichever comes first even
-                    # when it is the 0.0 one. Take the first non-zero instead.
+                    # 实机 DEAL 可能同时带拼写不同的两个费用字段，其中一个恒为零。
+                    # 优先取非零值；两者都缺失时保留未知，不能把未返回费用当作免佣。
                     commission=_first_nonzero(
-                        row, ("m_dComssion", "m_dCommission", "commission")),
+                        row, ("m_dComssion", "m_dCommission", "commission"), default=None),
                     offset_flag=_attr(row, ("m_nOffsetFlag", "offset_flag")),
                     direction=_attr(row, ("m_nDirection", "direction")),
                 )

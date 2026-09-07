@@ -982,6 +982,22 @@ class RedisRpcTest(unittest.TestCase):
         response = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:queued-tick"])
         self.assertTrue(response["ok"], response["error"])
 
+    def test_batch_instruments_stays_on_strategy_thread_with_wildcard(self):
+        """即使允许监听线程处理全部方法，批量原生详情也必须等策略线程排空。"""
+        redis_client, service = _service_with_listener_methods(
+            process_in_listener=True, listener_methods=("*",),
+        )
+        service.enqueue_payload({
+            "request_id": "batch-detail", "account_id": "acct",
+            "method": "get_instruments", "params": {"codes": ["600000.SH", "600001.SH"]},
+        })
+        key = "bigqmt:rpc:resp:acct:batch-detail"
+        self.assertNotIn(key, redis_client.kv)
+        self.assertEqual(service.drain_pending(), 1)
+        response = json.loads(redis_client.kv[key])
+        self.assertTrue(response["ok"], response["error"])
+        self.assertEqual(set(response["data"]), {"600000.SH", "600001.SH"})
+
     def test_process_in_listener_wildcard_only_handles_ping_inline(self):
         # get_full_tick is a market-data read (thread-safe in embedded terminal),
         # so it stays inline for low latency and responds immediately.

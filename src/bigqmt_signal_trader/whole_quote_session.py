@@ -106,6 +106,13 @@ class WholeQuoteClientSession(object):
             thread.join(timeout=1.0)
         self._heartbeat_thread = None
 
+    def close(self):
+        """关闭本地推送和心跳；服务端注册由既有租约过期机制清理。"""
+        with self._lock:
+            self._subscriptions.clear()
+            self._sync_subscriber_locked()
+        self.stop()
+
     def _heartbeat_loop(self):
         import time
 

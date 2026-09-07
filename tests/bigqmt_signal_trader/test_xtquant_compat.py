@@ -537,6 +537,7 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(xtdata.client.redis.events[1][0], "unsubscribe_quote")
 
     def test_optional_xtquant_shim_imports_constants_and_classes(self):
+        """标准 SDK 入口复用桥接实现，同时提供独立的严格兼容契约。"""
         from xtquant import xtconstant
         from xtquant.xttrader import XtQuantTrader
         from xtquant.xttype import StockAccount as ShimStockAccount
@@ -544,7 +545,7 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(xtconstant.STOCK_BUY, STOCK_BUY)
         self.assertEqual(xtconstant.FIX_PRICE, FIX_PRICE)
         self.assertEqual(xtconstant.SZ_MARKET, SZ_MARKET)
-        self.assertIs(XtQuantTrader, BigQmtXtTrader)
+        self.assertTrue(issubclass(XtQuantTrader, BigQmtXtTrader))
         self.assertEqual(ShimStockAccount("acct").account_id, "acct")
 
     def test_configure_updates_imported_xt_trader_object_in_place(self):

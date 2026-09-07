@@ -1,6 +1,33 @@
 import bigqmt_signal_trader.xtquant_compat as _compat
 
 
+def _sdk_quote_callback(callback):
+    """把桥接 K 线帧转换为 SDK 的证券到记录列表，time 使用 UTC Unix 毫秒。"""
+    if callback is None:
+        return None
+
+    def deliver(data):
+        """保留 Tick 结构；K 线时间缺失时从已规范化的上海时间索引补齐。"""
+        payload = {}
+        for code, value in data.items():
+            if not hasattr(value, "iterrows"):
+                payload[code] = value
+                continue
+            rows = []
+            for index, source in value.iterrows():
+                row = source.to_dict()
+                if row.get("time") is None:
+                    parsed = _compat._parse_qmt_stime(index)
+                    if parsed is None:
+                        raise ValueError("bar callback has no valid time")
+                    row["time"] = _compat._qmt_datetime_to_epoch_ms(parsed)
+                rows.append(row)
+            payload[code] = rows
+        callback(payload)
+
+    return deliver
+
+
 def __getattr__(name):
     return getattr(_compat.xtdata, name)
 
@@ -68,11 +95,13 @@ def get_sector_info(sector_name=""):
 
 
 def subscribe_quote(stock_code, period="1d", start_time="", end_time="", count=0, callback=None):
-    return _compat.xtdata.subscribe_quote(stock_code, period, start_time, end_time, count, callback)
+    """订阅标准 SDK 行情回调，K 线记录结构与 Tick 的调用约定一致。"""
+    return _compat.xtdata.subscribe_quote(stock_code, period, start_time, end_time, count, _sdk_quote_callback(callback))
 
 
 def subscribe_quote2(stock_code, period="1d", start_time="", end_time="", count=0, dividend_type=None, callback=None):
-    return _compat.xtdata.subscribe_quote2(stock_code, period, start_time, end_time, count, dividend_type, callback)
+    """扩展订阅使用同一回调转换，保留原有复权参数。"""
+    return _compat.xtdata.subscribe_quote2(stock_code, period, start_time, end_time, count, dividend_type, _sdk_quote_callback(callback))
 
 
 def subscribe_whole_quote(code_list, callback=None):
