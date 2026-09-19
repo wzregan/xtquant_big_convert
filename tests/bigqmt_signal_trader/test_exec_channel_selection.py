@@ -125,6 +125,41 @@ def _trader(transport, redis_client):
 
 
 class ChannelSelectionTest(unittest.TestCase):
+    def test_real_zmq_callback_without_overriding_channel_builder(self):
+        """真实连接缺少 Redis 的交易客户端，避免替身掩盖通道构造方法缺失。"""
+        import zmq
+        from bigqmt_signal_trader.quote_push_channel import encode_push_payload
+
+        context = zmq.Context()
+        publisher = context.socket(zmq.XPUB)
+        publisher.setsockopt(zmq.LINGER, 0)
+        port = publisher.bind_to_random_port('tcp://127.0.0.1')
+        trader, recorder = _trader('zmq', None)
+        trader.client.zmq_config = {'host': '127.0.0.1', 'port': port - 1}
+        try:
+            trader.start()
+            # 等订阅握手后只发送一次，避免重复发布掩盖监听丢失。
+            subscribed = False
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if publisher.poll(100):
+                    if publisher.recv() == b'\x01exec:order':
+                        subscribed = True
+                        break
+            self.assertTrue(subscribed, '交易客户端必须真正订阅执行事件通道')
+            for account in ('another-account', 'acct'):
+                event = dict(ORDER_EVENT, account_id=account, status=54, volume=100)
+                publisher.send_multipart([b'exec:order', encode_push_payload(
+                    {'combo_key': 'exec:order', 'data': event})])
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not recorder.names():
+                time.sleep(.01)
+            self.assertEqual(recorder.names(), ['order'])
+        finally:
+            trader.stop()
+            publisher.close()
+            context.term()
+
     def test_zmq_transport_with_working_redis_subscribes_redis_channels(self):
         """The #144 shape: zmq transport, Redis reachable -> Redis channels."""
         trader, recorder = _trader("zmq", None)

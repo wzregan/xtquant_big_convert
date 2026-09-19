@@ -1083,6 +1083,7 @@ def _apply_gil_tuning():
 
 
 def init(ContextInfo):
+    """初始化桥接并异步触发显式配置的独立 gRPC 伴随任务。"""
     detected_account_id = _detect_account_id(ContextInfo)
     if detected_account_id and not _account_id:
         set_account_id(detected_account_id)
@@ -1112,6 +1113,7 @@ def init(ContextInfo):
         _schedule_adjust_if_needed(ContextInfo, config)
     except Exception as exc:
         _log_startup_error("schedule adjust failed: %s" % exc)
+    _ensure_grpc_companion()
     print("[bigqmt_signal_trader] init ok")
 
     # 启动时自动诊断：检测服务状态 + 关键函数绑定，方便发现问题
@@ -1121,6 +1123,16 @@ def init(ContextInfo):
     except Exception as exc:
         _log_startup_error("context warmup failed to start: %s" % exc)
     return app
+
+
+
+def _ensure_grpc_companion():
+    """隔离伴随启动错误，确保 gRPC 启动失败不打断行情桥接。"""
+    try:
+        from bigqmt_signal_trader.grpc_companion import ensure_companion
+        ensure_companion(_config.get("grpc_companion"))
+    except Exception as exc:
+        _log_startup_error("gRPC companion failed: %s" % type(exc).__name__)
 
 
 def _log_startup_error(message):
@@ -1403,9 +1415,11 @@ def _adjust_phase(name, fn, *args):
 
 
 def adjust(ContextInfo, _source="timer"):
+    """驱动桥接队列并定期检查伴随任务启动，外部进程不阻塞 QMT 回调。"""
     global _adjust_logged
     _record_adjust_tick()
     _record_adjust_source(_source)
+    _ensure_grpc_companion()
     config = _build_config()
     _adjust_phase("drain", _drain_rpc_service, config)
     _adjust_phase("exec_hold", _flush_held_presysid_orders, config)

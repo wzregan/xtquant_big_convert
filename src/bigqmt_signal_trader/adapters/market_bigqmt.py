@@ -33,6 +33,7 @@ from ..code_utils import (
     EXCHANGE_TOKENS, FUTURES_MARKET_CODES, normalize_stock_code)
 from ..logging_setup import get_logger
 from ..quote_utils import find_code_payload, is_option_code, latest_quote_row
+from ..reference_data import normalize_instrument_detail
 
 
 log = get_logger("market")
@@ -569,6 +570,10 @@ class BigQmtMarketDataProvider:
             shapes.append((method_name, (), {
                 key: value for key, value in big_kwargs.items() if key != "fill_data"
             }))
+        if params.get("subscribe") is not None:
+            # 每个候选都保留只读语义，旧签名不支持时不能悄悄删参并自动订阅。
+            shapes = [(name, args, dict(kwargs, subscribe=params["subscribe"]))
+                      for name, args, kwargs in shapes]
         return shapes
 
     def _sector_codes(self, sector):
@@ -731,9 +736,10 @@ class BigQmtMarketDataProvider:
         )
 
     def get_instrument(self, code):
+        """读取本次合约详情，保留无效上市日期的原值与质量标记。"""
         normalized = normalize_stock_code(code)
         data = self.context_info.get_instrumentdetail(normalized)
-        return data or {}
+        return normalize_instrument_detail(normalized, data or {})
 
     def get_instrument_type(self, code, variety_list=None):
         if hasattr(self.context_info, "get_instrument_type"):
@@ -785,7 +791,7 @@ class BigQmtMarketDataProvider:
         )
 
     def get_market_data_ex(self, **kwargs):
-        """优先使用原始数组接口；旧版原始接口不支持显式填充参数时转用标准接口。"""
+        """优先原始数组接口，兼容回退必须保留填充和是否订阅的明确约束。"""
         raw_method = getattr(self.context_info, "get_market_data_ex_ori", None)
         if callable(raw_method):
             try:
@@ -793,7 +799,7 @@ class BigQmtMarketDataProvider:
                     self._market_data_shapes("get_market_data_ex_ori", **kwargs)
                 )
             except TypeError:
-                if kwargs.get("fill_data", True):
+                if kwargs.get("fill_data", True) and kwargs.get("subscribe") is None:
                     raise
             else:
                 return _raw_market_data_payload(
@@ -802,7 +808,7 @@ class BigQmtMarketDataProvider:
                     kwargs.get("stock_list") or kwargs.get("stock_code"),
                 )
         shapes = self._market_data_shapes("get_market_data_ex", **kwargs)
-        if hasattr(self.context_info, "get_market_data"):
+        if kwargs.get("subscribe") is not False and hasattr(self.context_info, "get_market_data"):
             shapes.extend(self._market_data_shapes("get_market_data", **kwargs))
         return self._call_first_supported(shapes)
 
@@ -927,14 +933,12 @@ class BigQmtMarketDataProvider:
         return merged
 
     def _download(self, func_name, sdk_args, sdk_kwargs, ctx_call):
-        """Download history in Big QMT.
-
-        Full Big QMT exposes historical-data supplementation as the injected
-        global ``down_history_data`` function. Prefer it directly; the MiniQMT
-        ``xtdata`` client usually cannot connect inside the full terminal.
-        """
+        """优先调用终端下载全局函数，明确区间刷新不能退化为空起点的增量下载。"""
         down_history_data = self.qmt_api.get("down_history_data")
         if callable(down_history_data):
+            # 大 QMT 全局函数没有增量参数，官方契约用非空起点表示整段重取。
+            if sdk_kwargs.get("incrementally") is False and not sdk_args[2]:
+                raise ValueError("大 QMT 非增量下载必须提供明确 start_time")
             if func_name == "download_history_data":
                 stock_code, period, start_time, end_time = sdk_args
                 return down_history_data(stock_code, period, start_time, end_time)
@@ -943,6 +947,8 @@ class BigQmtMarketDataProvider:
                 result = None
                 for stock_code in stock_list:
                     result = down_history_data(stock_code, period, start_time, end_time)
+                    if result is False:
+                        return False
                 return result
 
         if getattr(self.context_info, func_name, None) is not None:

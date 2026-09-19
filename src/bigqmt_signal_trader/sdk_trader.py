@@ -3,6 +3,7 @@
 import math
 import threading
 import time
+from concurrent.futures import Future
 
 from .sdk_contract import check_execution_context
 from .sdk_order_ids import OrderIdRegistry, trading_date
@@ -161,6 +162,11 @@ class XtQuantTrader(BigQmtXtTrader):
         """停止健康检查和事件线程；尚未退出时显式失败，禁止重复实例接管。"""
         self._health_stop.set()
         self._sdk_connected = False
+        pool = getattr(self.client, "_rpc_async_pool", None)
+        if pool is not None:
+            # 等待已发 RPC 完成后才能关闭共享传输，避免停机截断撤单结果。
+            pool.shutdown(wait=True)
+            self.client._rpc_async_pool = None
         result = super(XtQuantTrader, self).stop()
         thread = self._health_thread
         if thread is not None and thread is not threading.current_thread():
@@ -304,6 +310,48 @@ class XtQuantTrader(BigQmtXtTrader):
         if not isinstance(value, str) or not value:
             raise ValueError("invalid order_sysid")
         return value
+
+    def cancel_order_stock_deferred(self, account, order_id, timeout_seconds=None):
+        """发送撤单并返回结果 Future，远端仍按原协议确认，不伪造已撤状态。
+
+        account 必须属于当前已连接账户；order_id 为当日持久化映射编号。
+        timeout_seconds 是远端 RPC 等待秒数；超时通过 Future 原样传播，不重发。
+        """
+        result = Future()
+        result.set_running_or_notify_cancel()
+        account_id = _account_id(account, self.client.account_id)
+        if not self._sdk_connected or account_id != self.client.account_id:
+            result.set_result(-1)
+            return result
+        try:
+            # 在调用者线程解析编号；只有传输等待进入池，不能跨账户解析同号委托。
+            order_sysid = self._resolve_order_sys_id(order_id)
+            source = self.client.call_async(
+                "cancel_order_stock_sysid",
+                {"account_id": account_id, "market": "", "order_sysid": order_sysid},
+                account_id=account_id,
+                timeout_seconds=timeout_seconds,
+            )
+        except Exception as error:
+            result.set_exception(error)
+            return result
+
+        def finish(done):
+            """保留原同步撤单的返回语义；结果不明时不回落重发。"""
+            try:
+                value = done.result()
+                if isinstance(value, dict):
+                    value = 0 if value.get("success") else -1
+                elif isinstance(value, bool):
+                    value = 0 if value else -1
+                else:
+                    value = 0 if isinstance(value, int) and value == 0 else -1
+                result.set_result(value)
+            except Exception as error:
+                result.set_exception(error)
+
+        source.add_done_callback(finish)
+        return result
 
     def order_stock(
         self,

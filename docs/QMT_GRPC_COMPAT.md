@@ -100,4 +100,46 @@ python -m pytest -q -p no:cacheprovider -m 'not live and not live_ha'
 
 标准 SDK K 线回调转换只作用于 `xtquant.xtdata` 模块入口，直接使用 `BigQmtXtData` 的旧帧回调保持兼容。当前 K 线更新仍由客户端轮询取得，默认周期三秒；休市首快照不能证明盘中更新时延。
 
+### 2026-09-19：适配 master 的分钟流和历史 Tick
+
+qmt-grpc 适配分支已基于 `origin/master` 的 `4689c2c` 重放，支持 `StreamBars`、
+`GetBars(ENSURE_AVAILABLE)` 和 `GetTicksAt`。同时更新 QMT 内的桥接包与独立
+qmt-grpc 环境的兼容 SDK；仅替换其中一端不能保证新参数及历史语义生效。
+
+- 标准 `xtquant.xtdata.get_market_data_ex` 显式传 `subscribe=False`，并绕过公式直连、
+  复权自愈下载和昨收补查。`LOCAL_ONLY` 缺失时保留缺失，不暗中订阅或下载。
+  老终端如果不支持该参数，明确失败，不省略参数回退到自动订阅接口。
+- 历史 Tick 的原生 `time` 毫秒列优先于展示用 `stime`。缺少 `time` 才解析明确源标签，
+  保留毫秒；不把行号当时间，不裁剪零价行，不排序掩盖源数据乱序。
+  gRPC 继续负责严格小于/包含时点、最大落后秒数、字段完整性和逐项状态判断。
+- 下载完整透传 `incrementally=False`，强制刷新失败不能用客户端旧缓存报告成功。
+  终端只有四参数全局下载时，用明确起点表示指定区间刷新；没有起点则拒绝非增量请求。
+  逐证券下载任一失败不能被后续证券成功覆盖。
+- 一分钟实时轮询默认取最近两根且 `fill_data=False`，先传递上一根最新内容，
+  再由 qmt-grpc 的源推进规则闭合；比较两根内容，当前分钟未变也交付上一分钟晚到修订。
+  现有 SDK 记录回调转换、GAP 和退订路径保持一致。
+  它仍是轮询取得的原生分钟数据，不代表无损逐笔推送。
+- qmt-grpc 在首次订阅和重连恢复时，有界暂存早于订阅响应到达的分钟事件，
+  确认 worker 代次及句柄后按序投递；缓存溢出显式通知 GAP，失败请求清空暂存。
+  订阅 RPC 不占用事件路由锁，已有行情仍能接收。
+- 新历史 RPC 继承原有总预算和取消信号。取消会结束后台 IPC 排队/收包等待；
+  已进入终端原生调用的工作仍不能被强制中断。
+
+只读查询和全局下载参数依据[迅投 QMT 行情说明](https://dict.thinktrader.net/innerApi/question_answer.html)，
+标准 SDK 时间字段及下载参数依据[XtData 文档](https://dict.thinktrader.net/nativeApi/xtdata.html)。
+
+离线跨仓库测试需要把两个匹配工作树的 `src` 都加入 `PYTHONPATH`：
+
+```bash
+cd /data/code/qmt-grpc/.worktrees/bigqmt-backend-integration
+umask 0077
+PYTHONPATH=src:/data/code/xtquant_big_convert/.worktrees/qmt-grpc-sdk-compat/src \
+  python -m pytest -q tests/integration/grpc/test_bigqmt_market_compat.py \
+  tests/unit/market_data/test_history_request_cancellation.py
+```
+
+这些测试调用真实桥接处理器、兼容 SDK、本地认证 ZMQ、TLS gRPC 和公开客户端，
+QMT 行情源及桥接 RPC 网络为测试替身。本轮未部署 Windows；盘中仍需核对终端参数支持、
+历史下载完成后的覆盖、分钟闭合和时延，不能把离线通过当作实机验收。
+
 只读资产查询可以单独验证 SDK 查询和 qmt-grpc 金额映射。若现有服务端没有 `account_status_v1`，标准交易生命周期仍会拒绝连接，不能将资产查询通过解释为完整 gRPC 服务已经可以启动。

@@ -1509,13 +1509,7 @@ class BigQmtRpcHandlers:
         return self._call_qmt_global("get_hkt_exchange_rate")
 
     def _handle_download_history_data(self, params):
-        """download_history_data is a QMT global function (issue #32).
-
-        It is NOT a ContextInfo method — the adapter's _call_context path
-        always raised NotImplementedError. Now route through qmt_api (the
-        injected global), falling back to the adapter (which tries native
-        xtdata SDK then ContextInfo).
-        """
+        """调用终端单证券下载；全局函数以明确起点表达整段刷新语义。"""
         func = self.qmt_api.get("download_history_data")
         # Some QMT builds only expose down_history_data (same signature, 4 args).
         if func is None:
@@ -1526,6 +1520,8 @@ class BigQmtRpcHandlers:
                 period = str(params.get("period") or "1d")
                 start_time = str(params.get("start_time") or "")
                 end_time = str(params.get("end_time") or "")
+                if params.get("incrementally") is False and not start_time:
+                    raise ValueError("大 QMT 非增量下载必须提供明确 start_time")
                 result = func(stock_code, period, start_time, end_time)
                 return bool(result) if result is not None else True
             except Exception as exc:
@@ -1538,17 +1534,7 @@ class BigQmtRpcHandlers:
             return False
 
     def _handle_download_history_data2(self, params):
-        """download_history_data2 is a QMT global function (issue #32).
-
-        Native signature includes an optional callback for progress; the QMT
-        global may require it, so pass a no-op when the client didn't.
-
-        Some QMT builds expose only the single-stock download globals
-        (``download_history_data`` / ``down_history_data``) — fall back to a
-        per-code loop with those. Without this the RPC returned False and
-        nothing was downloaded, so reads only ever saw the latest day
-        (issue #54).
-        """
+        """批量下载保留刷新约束，逐证券回退时任一失败都不能被后续成功覆盖。"""
         stock_list = list(params.get("stock_list") or [])
         period = str(params.get("period") or "1d")
         start_time = str(params.get("start_time") or "")
@@ -1568,9 +1554,13 @@ class BigQmtRpcHandlers:
         single = self.qmt_api.get("download_history_data") or self.qmt_api.get("down_history_data")
         if single is not None:
             try:
+                if params.get("incrementally") is False and not start_time:
+                    raise ValueError("大 QMT 非增量下载必须提供明确 start_time")
                 result = None
                 for code in stock_list:
                     result = single(code, period, start_time, end_time)
+                    if result is not None and not bool(result):
+                        return False
                 return bool(result) if result is not None else True
             except Exception as exc:
                 raise RuntimeError("download_history_data2 per-code fallback failed: %s" % exc)

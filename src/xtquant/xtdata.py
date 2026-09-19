@@ -41,7 +41,11 @@ def get_market_data(field_list=[], stock_list=[], period="1d", start_time="", en
 
 
 def get_market_data_ex(field_list=[], stock_list=[], period="1d", start_time="", end_time="", count=-1, dividend_type="none", fill_data=True):
-    return _compat.xtdata.get_market_data_ex(field_list, stock_list, period, start_time, end_time, count, dividend_type, fill_data)
+    """标准 SDK 历史读取不隐式订阅，也不使用另一来源的公式缓存。"""
+    return _compat.xtdata.get_market_data_ex(
+        field_list, stock_list, period, start_time, end_time, count, dividend_type, fill_data,
+        use_formula=False, subscribe=False, backfill_pre_close=False,
+    )
 
 
 def get_local_data(field_list=[], stock_list=[], period="1d", start_time="", end_time="", count=-1, dividend_type="none", fill_data=True, data_dir=None):
@@ -141,7 +145,7 @@ def wait_download(job_id, timeout=None, poll_interval=None, callback=None):
 
 
 def download_history_data(stock_code, period, start_time="", end_time="", incrementally=None, dividend_type="none"):
-    # dividend_type 必须与随后的 get_local_data 一致, 否则复权缓存不命中。
+    """保留原有缓存和复权调用约定，增量标志完整传到终端下载。"""
     return _compat.xtdata.download_history_data(stock_code, period, start_time, end_time, incrementally, dividend_type)
 
 

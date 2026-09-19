@@ -30,6 +30,7 @@ from xtquant.xttype import StockAccount
 
 from .full_tick_cache import request_full_tick_cache, wait_full_tick_cache
 from .local_cache import LocalMarketCache
+from .reference_data import ETF_SECTORS, load_reference, normalize_instrument_detail
 from .order_id import OrderId, order_sys_id_of
 from .redis_rpc import TYPED_PAYLOAD_FLAG, call_redis_rpc
 from .async_worker import AsyncWorker
@@ -201,6 +202,16 @@ def _quote_push_zmq_address(client):
     port = zmq_config.get("port")
     base_port = int(port) if port is not None else _default_zmq_port(client.account_id)
     return "tcp://%s:%d" % (host, base_port + 1)
+
+
+def _build_client_push_channel(client):
+    """根据客户端传输配置构造独立推送通道，由调用方负责启动和关闭。"""
+    from .quote_push_channel import RedisQuotePushChannel, ZmqQuotePushChannel
+
+    transport_name = str(getattr(client, "transport_name", "redis") or "redis").lower()
+    if transport_name == "zmq":
+        return ZmqQuotePushChannel(connect_address=_quote_push_zmq_address(client))
+    return RedisQuotePushChannel(client._redis(), account_id=client.account_id)
 
 
 def _missing_account_id_message():
@@ -552,7 +563,13 @@ def _formula_stale_active():
 
 
 def _qmt_stime_index(value):
+    """把日期或原生 Unix 毫秒标签转换为上海时间索引，避免截断纪元时间。"""
     digits = _digits_only(value)
+    if len(digits) in (10, 13) and str(value).strip().isdigit():
+        china_tz = _dt.timezone(_dt.timedelta(hours=8))
+        return _dt.datetime.fromtimestamp(
+            _tick_time_millis(value) / 1000.0, china_tz,
+        ).strftime("%Y%m%d%H%M%S")
     if len(digits) >= 14:
         return digits[:14]
     if len(digits) >= 8:
@@ -629,12 +646,59 @@ def _trim_missing_bar_prefix(df):
     return df.iloc[start:].copy() if start else df
 
 
-def _normalize_market_data_frame(df, field_list=None):
-    """删除缺失历史占位行，并把 QMT 的 stime 转为 MiniQMT 日期索引和毫秒时间。"""
+def _tick_time_millis(value):
+    """将 Unix 秒/毫秒、QMT 紧凑日期时间或 datetime 转成毫秒；拒绝无效标签。"""
+    if isinstance(value, _dt.datetime):
+        parsed = value
+    else:
+        text = str(value).strip()
+        if text.isdigit() and len(text) in (10, 13):
+            return int(text) * (1000 if len(text) == 10 else 1)
+        # 仅删除 QMT 展示格式的分隔符；不能剥掉负号、时区或任意文本后猜时间。
+        digits = text.replace(" ", "").replace(":", "").replace(".", "")
+        if not digits.isdigit():
+            raise ValueError("历史 Tick 源时间格式不受支持")
+        if len(digits) == 8:
+            digits += "000000"
+        if len(digits) not in (14, 17, 20):
+            raise ValueError("历史 Tick 缺少有效源时间")
+        parsed = _dt.datetime.strptime(digits[:14], "%Y%m%d%H%M%S")
+        if len(digits) > 14:
+            parsed = parsed.replace(microsecond=int(digits[14:].ljust(6, "0")))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_dt.timezone(_dt.timedelta(hours=8)))
+    # 使用整数差值，避免浮点 timestamp 在严格毫秒边界少算一毫秒。
+    delta = parsed.astimezone(_dt.timezone.utc) - _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
+    return delta.days * 86400000 + delta.seconds * 1000 + delta.microseconds // 1000
+
+
+def _normalize_tick_frame(df, field_list=None):
+    """保留 Tick 原生毫秒和行序，不套用 K 线的零价裁剪或秒级时间索引。"""
+    out = df.copy()
+    # 原生 time 的精度高于展示用 stime，即使原生值无效也不能用展示值掩盖。
+    if "time" not in out.columns:
+        values = out["stime"] if "stime" in out.columns else out.index
+        times = []
+        for value in values:
+            try:
+                times.append(_tick_time_millis(value))
+            except (TypeError, ValueError, OverflowError, OSError):
+                times.append(None)
+        out["time"] = times
+    requested = list(field_list or [])
+    if requested:
+        return out[[field for field in requested if field in out.columns]]
+    return out.drop(columns=["stime"]) if "stime" in out.columns else out
+
+
+def _normalize_market_data_frame(df, field_list=None, period=None):
+    """按周期转换帧；K 线裁剪占位前缀，Tick 保留逐笔源时间和原始行序。"""
     try:
         columns = list(df.columns)
     except Exception:
         return df
+    if str(period).lower() in ("tick", "full_tick"):
+        return _normalize_tick_frame(df, field_list)
     df = _trim_missing_bar_prefix(df)
     if "stime" not in columns:
         return df
@@ -645,9 +709,11 @@ def _normalize_market_data_frame(df, field_list=None):
         stimes = list(out["stime"])
         out.index = [_qmt_stime_index(value) for value in stimes]
         if "time" in out.columns or "time" in requested:
+            # K 线 time 可能是终端预置的空列；只补空值，已有原生毫秒继续保留。
+            existing = list(out["time"]) if "time" in out.columns else [None] * len(out)
             out["time"] = [
-                _qmt_datetime_to_epoch_ms(parsed) if parsed is not None else None
-                for parsed in (_parse_qmt_stime(value) for value in stimes)
+                _tick_time_millis(stamp) if value is None or value != value else value
+                for value, stamp in zip(existing, stimes)
             ]
         if requested:
             keep = [field for field in requested if field in out.columns]
@@ -660,7 +726,7 @@ def _normalize_market_data_frame(df, field_list=None):
         return df
 
 
-def _normalize_market_data_result(data, field_list=None, stock_list=None):
+def _normalize_market_data_result(data, field_list=None, stock_list=None, period=None):
     """统一单股帧、证券分组和字段分组为证券到时间序列帧；旧字典继续兼容。"""
     codes = list(stock_list or [])
     if hasattr(data, "columns") and len(codes) == 1:
@@ -679,7 +745,7 @@ def _normalize_market_data_result(data, field_list=None, stock_list=None):
             for code in codes if any(code in frame.index for frame in data.values())
         }
     result = {
-        code: _normalize_market_data_frame(frame, field_list=field_list)
+        code: _normalize_market_data_frame(frame, field_list=field_list, period=period)
         for code, frame in data.items()
     }
     removed = sum(len(frame) - len(result[code]) for code, frame in data.items()
@@ -1038,11 +1104,13 @@ class BigQmtRpcClient:
     _ASYNC_RPC_MAX_IN_FLIGHT = 64
 
     def _async_rpc_pool(self):
+        """创建有界的 RPC 等待线程池，让一批二十笔撤单同时等待远端确认。"""
         pool = getattr(self, "_rpc_async_pool", None)
         if pool is None:
             from concurrent.futures import ThreadPoolExecutor
 
-            pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="bigqmt-rpc-async")
+            # QMT 仍在策略线程发送指令；这里的线程只等待各自 RPC 响应。
+            pool = ThreadPoolExecutor(max_workers=32, thread_name_prefix="bigqmt-rpc-async")
             self._rpc_async_pool = pool
             self._rpc_async_slots = threading.Semaphore(self._ASYNC_RPC_MAX_IN_FLIGHT)
             self._rpc_async_dispatcher = None
@@ -1314,21 +1382,24 @@ class _BarPoller(object):
 
     @staticmethod
     def _signature(data):
-        """比较最后一根的时间和内容，盘中同一根 K 线价格、成交量变化也必须通知。"""
+        """比较最近两根的时间和内容，保留当前更新及上一分钟晚到的闭合修订。"""
         try:
             for value in (data or {}).values():
                 if value is None:
                     continue
-                if hasattr(value, "empty"):          # pandas DataFrame
+                if hasattr(value, "empty"):
                     if getattr(value, "empty", True):
                         continue
-                    return (str(value.index[-1]), int(len(value)),
-                            tuple((str(key), repr(item)) for key, item in value.iloc[-1].items()))
+                    # 当前分钟可能完全未变，不能只比较最后一行而吞掉上一分钟修订。
+                    return (int(len(value)), tuple(
+                        (str(index), tuple((str(key), repr(item)) for key, item in row.items()))
+                        for index, row in value.tail(2).iterrows()
+                    ))
                 if isinstance(value, (list, tuple)) and value:
-                    return repr(value[-1]), len(value)
+                    return repr(value[-2:]), len(value)
                 if isinstance(value, dict) and value:
-                    key = sorted(value.keys())[-1]
-                    return repr(key), len(value)
+                    keys = sorted(value.keys())[-2:]
+                    return tuple((repr(key), repr(value[key])) for key in keys), len(value)
         except Exception:
             return None
         return None
@@ -1645,7 +1716,9 @@ class BigQmtXtData:
 
     def get_instrument_detail(self, stock_code):
         """读取当前单证券详情，保持原生单项接口的新鲜度。"""
-        return self.client.call("get_instrument_detail", {"code": stock_code}) or {}
+        return normalize_instrument_detail(
+            stock_code, self.client.call("get_instrument_detail", {"code": stock_code}) or {}
+        )
 
     def get_instrument_details(self, code_list):
         """批量详情扩展：最多五百个代码，按代码返回本次详情或空值，不缓存状态。"""
@@ -1674,7 +1747,7 @@ class BigQmtXtData:
                     result[code] = None
         if not isinstance(result, dict):
             raise ValueError("invalid get_instruments response")
-        return result
+        return {code: normalize_instrument_detail(code, raw) for code, raw in result.items()}
 
     def get_instrumentdetail(self, stock_code):
         return self.get_instrument_detail(stock_code)
@@ -1717,7 +1790,11 @@ class BigQmtXtData:
         )
 
     def get_stock_list_in_sector(self, sector_name, real_timetag=-1):
+        """读取板块；显式配置的 ETF 当日参考源不得用于历史成分查询。"""
         name = str(sector_name or "")
+        if name in ETF_SECTORS and real_timetag in (-1, None) and os.environ.get("BIGQMT_ETF_REFERENCE_FILE"):
+            reference, _cycles = load_reference()
+            return list(reference["sectors"][name])
         try:
             return self._call("get_stock_list_in_sector", sector_name=sector_name, real_timetag=real_timetag) or []
         except Exception:
@@ -1757,18 +1834,22 @@ class BigQmtXtData:
             data, field_list=params["field_list"], stock_list=params["stock_list"]))
 
     def _get_market_data_ex_batch(self, params, timeout_seconds=None, use_formula=True):
-        """One RPC's worth of bars, healed and normalized. No caching."""
+        """读取一批并按周期归一化；显式本地查询必须直读终端缓存。"""
+        if params.get("subscribe") is False:
+            use_formula = False
         if use_formula:
             data = self.client.call("get_market_data_ex", params, timeout_seconds=timeout_seconds)
         else:
             # 只在绕路时显式传参——保持既有调用方/桩签名不变。
             data = self.client.call("get_market_data_ex", params, timeout_seconds=timeout_seconds,
                                     use_formula=False)
-        # Self-heal adjusted reads (all-zero bars -> server raw download + retry).
-        data = self._heal_adjusted("get_market_data_ex", params, data, timeout_seconds=timeout_seconds)
+        # 显式本地读取不能触发复权自愈下载，缺失结果交由上层覆盖策略处理。
+        if params.get("subscribe") is not False:
+            data = self._heal_adjusted("get_market_data_ex", params, data, timeout_seconds=timeout_seconds)
         # 在进入缓存前过滤占位历史，并兼容只返回单个帧的终端。
         data = _normalize_market_data_result(data, field_list=params.get("field_list"),
-                                             stock_list=params.get("stock_list"))
+                                             stock_list=params.get("stock_list"),
+                                             period=params.get("period"))
         return data
 
     @staticmethod
@@ -1913,31 +1994,15 @@ class BigQmtXtData:
         timeout_seconds=None,
         use_formula=True,
         backfill_pre_close=True,
+        subscribe=None,
     ):
-        """Pull bars over RPC, in batches of ``chunk_size`` codes.
+        """分批读取行情，并按周期和复权方式写入启用的客户端缓存。
 
-        Cache-through: whatever is fetched is written to the local cache (keyed
-        by dividend_type), so it stays the latest -- important for 前复权 data,
-        whose history re-scales on each dividend.
-
-        Batching exists because one request carrying every code shares a single
-        RPC timeout (6s by default), so a wide stock_list times out and loses
-        the whole pull rather than degrading (issue #47). Splitting keeps each
-        request small enough to answer, and a batch that still fails only costs
-        its own codes -- the rest are returned.
-
-        ``chunk_size=0`` restores the old single-request behaviour.
-
-        An empty ``field_list`` means "every field", which only the RPC path can
-        answer: FormulaServer has the six bar columns plus time, and not the
-        four daily ones (settelementPrice, openInterest, preClose,
-        suspendFlag). Naming the fields you actually want is what unlocks the
-        direct path -- 0.015s against 5.8s, measured (issue #104).
-
-        Asking it for a field it lacks is now refused at the router and served
-        by RPC instead. It used to answer with a column of NaN, so naming all
-        eleven columns looked like a free speedup and quietly cost four of them
-        (see formula_server.SERVED_FIELDS).
+        chunk_size=0 表示单次请求；分批时保留成功证券，全部失败才抛出异常。
+        timeout_seconds 是每批 RPC 的秒数预算。field_list 为空表示全部字段，
+        公式直连仅用于它实际支持的字段，其他请求走终端 RPC。
+        subscribe=None 保留直接桥接的历史行为；False 强制只读终端缓存，
+        禁止隐式订阅、公式直连和复权自愈下载。标准 SDK 历史接口显式使用 False。
         """
         _notice_field_list_cost(field_list)
         codes = list(stock_list or [])
@@ -1950,6 +2015,9 @@ class BigQmtXtData:
             dividend_type=dividend_type,
             fill_data=fill_data,
         )
+        # None 保留直接桥接调用的旧行为；标准 SDK 显式 False，禁止查询暗中订阅。
+        if subscribe is not None:
+            base["subscribe"] = subscribe
         step = DEFAULT_MARKET_DATA_CHUNK if chunk_size is None else int(chunk_size)
 
         if step <= 0 or len(codes) <= step:
@@ -2031,7 +2099,8 @@ class BigQmtXtData:
                 fill_data=fill_data,
                 data_dir=data_dir,
             )
-            return _normalize_market_data_result(data, field_list=field_list, stock_list=codes)
+            return _normalize_market_data_result(data, field_list=field_list, stock_list=codes,
+                                                 period=period)
         fields = list(field_list or [])
         result = {}
         missing = []
@@ -2039,7 +2108,7 @@ class BigQmtXtData:
             df = cache.read(code, period, start_time, end_time, count, dividend_type=dividend_type)
             if df is not None and getattr(df, "shape", (0,))[0] > 0:
                 result[code] = self._select_fields(
-                    _normalize_market_data_frame(df, field_list=fields),
+                    _normalize_market_data_frame(df, field_list=fields, period=period),
                     fields,
                 )
             else:
@@ -2050,7 +2119,7 @@ class BigQmtXtData:
                 df = fetched.get(code)
                 if df is not None and getattr(df, "shape", (0,))[0] > 0:
                     result[code] = self._select_fields(
-                        _normalize_market_data_frame(df, field_list=fields),
+                        _normalize_market_data_frame(df, field_list=fields, period=period),
                         fields,
                     )
         return result
@@ -2211,8 +2280,9 @@ class BigQmtXtData:
             # 直连会把"刚完成的 bar"发成数小时前的旧快照（issue #104 实测）。
             return self.get_market_data_ex(
                 stock_list=[stock_code], period=period,
-                start_time=start_time, end_time=end_time, count=count or 1,
-                use_formula=False)
+                start_time=start_time, end_time=end_time,
+                count=count or (2 if period == "1m" else 1),
+                fill_data=False, use_formula=False)
 
         poller = _BarPoller(
             fetch, callback, self._bar_poll_interval_seconds(),
@@ -2286,17 +2356,8 @@ class BigQmtXtData:
         )
 
     def _build_quote_push_channel(self):
-        """Build the push-channel subscriber matching the RPC transport: redis
-        deployments derive the channel locally; zmq deployments connect to the
-        server PUB socket (host from zmq config, RPC port + 1)."""
-        client = self.client
-        from .quote_push_channel import RedisQuotePushChannel, ZmqQuotePushChannel
-
-        transport_name = str(getattr(client, "transport_name", "redis") or "redis").lower()
-        if transport_name in ("zmq",):
-            address = _quote_push_zmq_address(client)
-            return ZmqQuotePushChannel(connect_address=address)
-        return RedisQuotePushChannel(client._redis(), account_id=client.account_id)
+        """构造行情订阅通道，与交易回报共用地址解析规则。"""
+        return _build_client_push_channel(self.client)
 
     def subscribe_whole_quote(self, code_list, callback=None):
         session = self._whole_quote_session()
@@ -2403,17 +2464,20 @@ class BigQmtXtData:
         # bars from raw bars + dividend factors, and both must exist server-side
         # or the result is all zeros.
         server_download_error = None
+        download_params = {
+            "stock_list": codes, "period": period,
+            "start_time": start_time, "end_time": end_time,
+        }
+        if incrementally is not None:
+            download_params["incrementally"] = incrementally
         try:
-            self.client.call(
+            download_result = self.client.call(
                 "download_history_data2",
-                {
-                    "stock_list": codes,
-                    "period": period,
-                    "start_time": start_time,
-                    "end_time": end_time,
-                },
+                download_params,
                 timeout_seconds=float(download_timeout_seconds),
             )
+            if download_result is False:
+                raise RuntimeError("历史下载失败")
         except Exception as exc:
             # Best-effort only while the pull below can still save the
             # download (data already on the server). With the local cache
@@ -2421,6 +2485,10 @@ class BigQmtXtData:
             # whole job, and reporting {finished: total} after a failed one
             # is the fake progress of issue #47.
             server_download_error = exc
+
+        # 明确要求刷新时，旧客户端缓存不能替代一次失败的服务端下载。
+        if incrementally is False and server_download_error is not None:
+            raise server_download_error
 
         if self._local_cache() is None:
             # local cache disabled: server-side download only (step 1). The
@@ -2484,7 +2552,9 @@ class BigQmtXtData:
         return {"finished": finished, "total": total}
 
     def download_history_data(self, stock_code, period, start_time="", end_time="", incrementally=None, dividend_type="none"):
-        return self.download_history_data2([stock_code], period, start_time, end_time, dividend_type=dividend_type)
+        """下载单证券历史并透传增量标志，False 表示必须刷新指定区间。"""
+        return self.download_history_data2([stock_code], period, start_time, end_time,
+                                           incrementally=incrementally, dividend_type=dividend_type)
 
     def local_cache_stats(self):
         """Return (cached files, periods) for the client-side local cache."""
@@ -3157,15 +3227,12 @@ class BigQmtXtTrader:
         except Exception:
             log.exception("user callback failed: on_account_status")
 
-    def _event_loop_push_channel(self):
-        """One push-channel round: zmq exec events arrive on the same PUB
-        socket as whole-quote data.
+    def _build_quote_push_channel(self):
+        """构造交易回报订阅通道；交易类不能依赖仅在行情类上定义的方法。"""
+        return _build_client_push_channel(self.client)
 
-        Reuses _build_quote_push_channel so the address derivation stays in one
-        place. Single round: returns when the account changes or the channel
-        dies, so the caller's per-round channel selection runs again (Redis may
-        have come back, or gone away).
-        """
+    def _event_loop_push_channel(self):
+        """监听一轮 ZMQ 执行事件；账户切换或通道失败后重新选择传输。"""
         from .exec_events import EXEC_TOPICS
 
         topics = sorted(set(EXEC_TOPICS.values()))
@@ -3179,6 +3246,7 @@ class BigQmtXtTrader:
                     return       # account changed -> rebuild against the new address
                 time.sleep(0.5)
         except Exception:
+            log.exception("执行事件推送通道异常，将在一秒后重试")
             time.sleep(1.0)
         finally:
             if channel is not None:

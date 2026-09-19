@@ -4,7 +4,7 @@ import os
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -448,6 +448,79 @@ def test_order_query_trade_callback_and_cancel_use_same_integer(rpc, trader):
     assert (
         trader._order_from_dict("A100", {"user_order_id": "remark-only"}).order_id == 0
     )
+
+
+def test_deferred_cancel_twenty_rpc_waiters_overlap(rpc, trader):
+    """二十个真实客户端线程同时等待响应，编号映射和账号参数仍逐笔正确。"""
+    trader._sdk_connected = True
+    entered = threading.Event()
+    release = threading.Event()
+    lock = threading.Lock()
+    requests = []
+
+    def call(method, params, **kwargs):
+        """在传输边界挂起，直到所有请求都已到达才释放回报。"""
+        assert method == "cancel_order_stock_sysid"
+        assert kwargs == {"account_id": "A100", "timeout_seconds": 3}
+        with lock:
+            requests.append(params)
+            if len(requests) == 20:
+                entered.set()
+        assert release.wait(3)
+        return {"success": True}
+
+    rpc.client.call = call
+    futures = []
+    try:
+        for index in range(20):
+            order_id = trader._order_id("SYS-%02d" % index)
+            futures.append(trader.cancel_order_stock_deferred(StockAccount("A100"), order_id, 3))
+        assert entered.wait(2), "一批二十笔不能被八线程池拆成多轮等待"
+        assert all(not future.done() and not future.cancel() for future in futures)
+        assert {r["order_sysid"] for r in requests} == {"SYS-%02d" % i for i in range(20)}
+        assert all(r["account_id"] == "A100" and r["market"] == "" for r in requests)
+    finally:
+        release.set()
+        for future in futures:
+            assert future.result(timeout=3) == 0
+
+
+@pytest.mark.parametrize("raw, expected", [({"success": True}, 0), ({"success": False}, -1),
+                                          (True, 0), (False, -1), (0, 0), (-1, -1)])
+def test_deferred_cancel_preserves_response_contract(rpc, trader, raw, expected):
+    """只有响应到达后才能完成 Future，受理与拒绝沿用同步接口契约。"""
+    trader._sdk_connected = True
+    source = Future()
+    rpc.client.call_async = Mock(return_value=source)
+    result = trader.cancel_order_stock_deferred(StockAccount("A100"), trader._order_id("SYS-1"))
+    assert not result.done()
+    source.set_result(raw)
+    assert result.result() == expected
+    rpc.client.call_async.assert_called_once()
+
+
+def test_deferred_cancel_propagates_timeout_without_resending(rpc, trader):
+    """响应不明保留异常，不能改调同步接口并重复发送。"""
+    trader._sdk_connected = True
+    source = Future()
+    rpc.client.call_async = Mock(return_value=source)
+    rpc.client.call = Mock(side_effect=AssertionError("禁止同步重发"))
+    result = trader.cancel_order_stock_deferred(StockAccount("A100"), trader._order_id("SYS-1"))
+    source.set_exception(TimeoutError("模拟响应超时"))
+    with pytest.raises(TimeoutError):
+        result.result()
+    rpc.client.call_async.assert_called_once()
+    rpc.client.call.assert_not_called()
+
+
+@pytest.mark.parametrize("connected, account", [(False, "A100"), (True, "OTHER")])
+def test_deferred_cancel_rejects_disconnected_or_wrong_account(rpc, trader, connected, account):
+    """断连和跨账号请求在进入 RPC 线程池前拒绝。"""
+    trader._sdk_connected = connected
+    rpc.client.call_async = Mock()
+    result = trader.cancel_order_stock_deferred(StockAccount(account), 1)
+    assert result.result() == -1
+    rpc.client.call_async.assert_not_called()
 
 
 def test_missing_submission_id_is_unknown(trader):
