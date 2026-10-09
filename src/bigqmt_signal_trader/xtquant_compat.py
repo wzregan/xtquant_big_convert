@@ -32,7 +32,7 @@ from .full_tick_cache import request_full_tick_cache, wait_full_tick_cache
 from .local_cache import LocalMarketCache
 from .reference_data import ETF_SECTORS, load_reference, normalize_instrument_detail
 from .order_id import OrderId, order_sys_id_of
-from .redis_rpc import TYPED_PAYLOAD_FLAG, call_redis_rpc
+from .redis_rpc import TYPED_PAYLOAD_FLAG, call_redis_rpc as call_redis_rpc
 from .async_worker import AsyncWorker
 from .logging_setup import get_logger
 
@@ -190,28 +190,36 @@ def _quote_client_id():
 
 
 def _quote_push_zmq_address(client):
-    """Derive the server whole-quote PUB address: same host as the RPC zmq
-    endpoint, RPC port + 1 (the PUB socket binds a distinct port)."""
-    from .transports.zmq_transport import DEFAULT_ZMQ_HOST, _default_zmq_port
+    """保留历史辅助入口，客户端推送地址由 ZMQ 后端统一计算。"""
+    from .transports.backend import zmq_push_address
 
-    zmq_config = dict(getattr(client, "zmq_config", {}) or {})
-    explicit = zmq_config.get("quote_push_connect_address")
-    if explicit:
-        return str(explicit)
-    host = zmq_config.get("host") or DEFAULT_ZMQ_HOST
-    port = zmq_config.get("port")
-    base_port = int(port) if port is not None else _default_zmq_port(client.account_id)
-    return "tcp://%s:%d" % (host, base_port + 1)
+    return zmq_push_address(
+        "client", _client_communication_config(client), client.account_id,
+    )
 
 
-def _build_client_push_channel(client):
-    """根据客户端传输配置构造独立推送通道，由调用方负责启动和关闭。"""
-    from .quote_push_channel import RedisQuotePushChannel, ZmqQuotePushChannel
+def _client_communication_config(client):
+    """构造后端参数副本，Redis 工厂保持惰性，避免其它后端建立额外连接。"""
+    config = dict(getattr(client, "transport_config", {}) or {})
+    config["zmq"] = dict(getattr(client, "zmq_config", {}) or {})
+    config["mysql"] = dict(getattr(client, "mysql_config", {}) or {})
+    config["redis_client_factory"] = getattr(client, "_redis", None)
+    return config
 
-    transport_name = str(getattr(client, "transport_name", "redis") or "redis").lower()
-    if transport_name == "zmq":
-        return ZmqQuotePushChannel(connect_address=_quote_push_zmq_address(client))
-    return RedisQuotePushChannel(client._redis(), account_id=client.account_id)
+
+def _client_backend(client):
+    """使用客户端创建时选定的定义，兼容仅提供旧属性的轻量客户端。"""
+    from .transports.backend import get_backend
+
+    backend = getattr(client, "communication_backend", None)
+    return backend if backend is not None else get_backend(getattr(client, "transport_name", "redis"))
+
+
+def _build_client_push_channel(client, subscriber_role=None):
+    """按固定后端创建推送通道；subscriber_role 为后续分用途订阅保留的参数。"""
+    return _client_backend(client).build_push_channel(
+        "client", _client_communication_config(client), account_id=client.account_id,
+    )
 
 
 def _missing_account_id_message():
@@ -914,19 +922,31 @@ class BigQmtRpcClient:
             "memory_max_bytes": int(local_cache_config.get("memory_max_bytes", 64 * 1024 * 1024)),
             "memory_max_entries": int(local_cache_config.get("memory_max_entries", 32)),
         }
-        # Transport selection. Default "redis" keeps the legacy call_redis_rpc
-        # path (so existing client configs are unchanged). Setting transport to
-        # "zmq"/"mysql"/"shm" (via config or constructor) routes calls through
-        # the swappable transport layer instead.
+        from .transports.backend import config_bool, copy_backend_config, get_backend
+
+        # 固定后端定义及配置快照，注册表替换只影响后来创建的客户端。
         self.transport_name = str(
             transport
             or merged_redis_config.get("transport")
             or os.environ.get("BIGQMT_RPC_TRANSPORT")
             or "redis"
-        ).lower()
-        self.zmq_config = dict(merged_redis_config.get("zmq") or {})
-        self.mysql_config = dict(merged_redis_config.get("mysql") or {})
-        self._transport_instance = None  # lazily built by _transport()
+        ).strip().lower()
+        self.communication_backend = get_backend(self.transport_name)
+        self.transport_name = self.communication_backend.name
+        self.zmq_config = copy_backend_config(dict(merged_redis_config.get("zmq") or {}))
+        self.mysql_config = copy_backend_config(dict(merged_redis_config.get("mysql") or {}))
+        # 保留未知后端参数，新增实现无需修改 SDK 的参数白名单。
+        self.transport_config = copy_backend_config(merged_redis_config)
+        redis_configured = (
+            redis_client is not None
+            or self.communication_backend.redis_auxiliary_default
+            or config_bool(self.zmq_config.get("redis_discovery_enabled"), False)
+            or any(key in merged_redis_config for key in ("host", "port", "db", "username", "password", "redis"))
+        )
+        self.redis_auxiliary_enabled = config_bool(merged_redis_config.get("redis_enabled"), redis_configured)
+        self._transport_instance = None
+        self._transport_lock = threading.Lock()
+        self._redis_lock = threading.Lock()
         # FormulaServer read fast-path. QMT's C++ quote service (port 58600)
         # answers reference/history reads in ~0.07ms without touching the QMT
         # python thread. Enabled by default; every miss falls back to RPC, so a
@@ -942,50 +962,33 @@ class BigQmtRpcClient:
         self._formula_router_instance = None  # lazily built by _formula_router()
 
     def _redis(self):
+        """并发惰性创建兼容 Redis 客户端，注入对象由原调用方持有。"""
         if self.redis_client is None:
-            import redis
+            with self._redis_lock:
+                if self.redis_client is None:
+                    import redis
+                    from .adapters.redis_common import redis_supports_protocol_kw
 
-            from .adapters.redis_common import redis_supports_protocol_kw
-
-            cfg = dict(self.redis_config)
-            if not cfg.get("username"):
-                cfg.pop("username", None)
-            if not cfg.get("password"):
-                cfg.pop("password", None)
-            if not redis_supports_protocol_kw():
-                # QMT 自带 redis-py 3.5.3 不认 protocol（issue #71）
-                cfg.pop("protocol", None)
-            self.redis_client = redis.Redis(**cfg)
+                    cfg = dict(self.redis_config)
+                    if not cfg.get("username"):
+                        cfg.pop("username", None)
+                    if not cfg.get("password"):
+                        cfg.pop("password", None)
+                    if not redis_supports_protocol_kw():
+                        # QMT 自带 redis-py 3.5.3 不认 protocol（issue #71）。
+                        cfg.pop("protocol", None)
+                    self.redis_client = redis.Redis(**cfg)
         return self.redis_client
 
     def _transport(self):
+        """并发首次调用只创建一个 RPC 通道，稳态直接复用，不再读取外部配置。"""
         if self._transport_instance is None:
-            if self.transport_name in ("redis", "", "default"):
-                # Legacy path: call_redis_rpc builds its own request envelope.
-                return None
-            from .transports.factory import build_transport
-
-            client_config = load_client_config()
-            config_redis = dict(client_config.get("redis_config") or {})
-            zmq_config = dict(config_redis.get("zmq") or {})
-            zmq_config.update(self.zmq_config)
-            # ZMQ must work without Redis. Discovery is opt-in and unnecessary
-            # when connect_address is explicitly configured.
-            if (
-                not zmq_config.get("connect_address")
-                and bool(zmq_config.get("redis_discovery_enabled", False))
-            ):
-                zmq_config.setdefault("discovery_redis_client", self._redis())
-            factory_config = {
-                "zmq": zmq_config,
-                "mysql": dict(config_redis.get("mysql") or {}, **self.mysql_config),
-            }
-            self._transport_instance = build_transport(
-                self.transport_name,
-                factory_config,
-                account_id=self.account_id,
-                print_prefix="[bigqmt_client]",
-            )
+            with self._transport_lock:
+                if self._transport_instance is None:
+                    self._transport_instance = self.communication_backend.build_rpc_transport(
+                        _client_communication_config(self), account_id=self.account_id,
+                        print_prefix="[bigqmt_client]",
+                    )
         return self._transport_instance
 
     def _formula_router(self):
@@ -1052,39 +1055,33 @@ class BigQmtRpcClient:
         # 只有成功的真实桥接 RPC 可以续期连接凭据；本地缓存及 FormulaServer 不算。
         self._last_rpc_success_monotonic = 0.0
         transport = self._transport()
-        if transport is not None:
-            # Swappable transport path (zmq/mysql/...). Build the request
-            # envelope the same way call_redis_rpc does.
-            request = {
-                "schema_version": 1,
-                "request_id": uuid.uuid4().hex,
-                "account_id": target_account,
-                "method": method,
-                "params": params or {},
-                "ttl_seconds": 60,
-                "dataframe_format": dataframe_format,
-            }
-            response = transport.send_request(request, wait_seconds)
-        else:
-            response = call_redis_rpc(
-                self._redis(),
-                account_id=target_account,
-                method=method,
-                params=params or {},
-                timeout_seconds=wait_seconds,
-                dataframe_format=dataframe_format,
-            )
+        # 所有后端共用请求封装、格式协商和错误解释，Redis 也不绕过工厂。
+        request = {
+            "schema_version": 1,
+            "request_id": uuid.uuid4().hex,
+            "account_id": target_account,
+            "method": method,
+            "params": params or {},
+            "ttl_seconds": 60,
+            "dataframe_format": dataframe_format,
+        }
+        response = transport.send_request(request, wait_seconds)
         if not response.get("ok"):
             raise RpcServerRepliedError(
                 response.get("error") or "Big QMT RPC failed: %s" % method,
-                error_code=response.get("error_code", ""))
+                error_code=response.get("error_code", ""),
+                outcome_unknown=response.get("outcome_unknown"),
+                request_id=response.get("request_id"))
         # server_error 携带 QMT 端诊断（如 passorder 提交但委托没进系统）。
         # 只在交易类方法上设置（读取类恒为空），转成异常让调用方看到真实原因，
         # 而不是把「无委托号」误判为 -1 失败（issue #38）。
         server_error = str(response.get("server_error") or "")
         if server_error:
             raise RpcServerRepliedError(
-                "Big QMT %s server_error: %s" % (method, server_error))
+                "Big QMT %s server_error: %s" % (method, server_error),
+                error_code=response.get("error_code", ""),
+                outcome_unknown=response.get("outcome_unknown"),
+                request_id=response.get("request_id"))
         # The transport already scanned the raw text for a typed envelope; when
         # it found none there is provably nothing to rebuild, and skipping the
         # walk turns 345.9ms into 3.7ms on a 51285-instrument snapshot. A None
@@ -1162,6 +1159,7 @@ class BigQmtRpcClient:
         return future
 
     def publish_event(self, event_type, payload, stream_template="bigqmt:quote_events:{account_id}"):
+        """在启用 Redis 辅助功能时保存行情事件，始终返回规范化的事件字典。"""
         account_id = str(self.account_id or "")
         event = {
             "event_type": str(event_type),
@@ -1169,8 +1167,7 @@ class BigQmtRpcClient:
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "payload": payload or {},
         }
-        # 显式地址且未启用 Redis discovery 的 ZMQ 是纯 ZMQ 模式，不应隐式连接 Redis。
-        if self.transport_name == "zmq" and not bool(self.zmq_config.get("redis_discovery_enabled", False)):
+        if not self.redis_auxiliary_enabled:
             return event
         raw = json.dumps(event, ensure_ascii=False, default=str)
         stream_key = stream_template.format(account_id=account_id)
@@ -1186,8 +1183,8 @@ class BigQmtRpcClient:
         return event
 
     def save_quote_subscription(self, seq, payload, active=True):
-        # MySQL、SHM 和混合 ZMQ 继续保留既有 Redis subscription metadata 行为。
-        if self.transport_name == "zmq" and not bool(self.zmq_config.get("redis_discovery_enabled", False)):
+        """仅在启用 Redis 辅助功能时保存订阅元数据，避免其它后端隐式连接。"""
+        if not self.redis_auxiliary_enabled:
             return
         account_id = str(self.account_id or "")
         key = "bigqmt:quote_subscriptions:%s" % account_id
@@ -1258,18 +1255,17 @@ BATCH_TIMEOUT_PER_ITEM_SECONDS = 0.5
 
 
 class RpcServerRepliedError(RuntimeError):
-    """The server answered with an error -- as opposed to a timeout/transport
-    failure, where the request's fate is unknown.
+    """服务端明确返回错误；错误回复也可能发生在业务执行之后，不能据此重报。"""
 
-    The distinction matters for writes: a batch submit handler raises only
-    before its per-item loop, so a replied error means no item ran and a retry
-    is safe. A timeout means the batch may still be running and retrying
-    doubles orders."""
+    def __init__(self, message, error_code="", outcome_unknown=None, request_id=None):
+        """原样保存错误码与请求编号；outcome_unknown 为显式布尔值或未知的 None。
 
-    def __init__(self, message, error_code=""):
-        """保存服务端明确错误码；仅 EXECUTION_NOT_STARTED 可证明没有进入原生下单。"""
+        None 保留旧服务没有声明结果确定性的语义，不能推断为确定尚未执行。
+        """
         super(RpcServerRepliedError, self).__init__(message)
         self.error_code = error_code
+        self.outcome_unknown = outcome_unknown
+        self.request_id = request_id
 
 
 
@@ -1563,7 +1559,8 @@ class BigQmtXtData:
         if not codes:
             return {}
         cache_config = dict(getattr(self.client, "full_tick_cache_config", {}) or {})
-        if _bool_value(cache_config.get("enabled"), False):
+        if (_bool_value(cache_config.get("enabled"), False)
+                and getattr(self.client, "redis_auxiliary_enabled", True)):
             redis_client = self.client._redis()
             request_full_tick_cache(
                 redis_client,
@@ -2357,7 +2354,7 @@ class BigQmtXtData:
 
     def _build_quote_push_channel(self):
         """构造行情订阅通道，与交易回报共用地址解析规则。"""
-        return _build_client_push_channel(self.client)
+        return _build_client_push_channel(self.client, subscriber_role="quote")
 
     def subscribe_whole_quote(self, code_list, callback=None):
         session = self._whole_quote_session()
@@ -3005,6 +3002,8 @@ class BigQmtXtData:
         return BigQmtXtData.timetag_to_datetime(timetag, format)
 
 
+
+
 class BigQmtXtTrader:
     def __init__(
         self,
@@ -3077,11 +3076,10 @@ class BigQmtXtTrader:
         return asset if isinstance(asset, dict) else {}
 
     def _redis_cache_enabled(self):
-        return str(getattr(self.client, "transport_name", "redis") or "redis").lower() in (
-            "redis",
-            "",
-            "default",
-        )
+        """保留声明使用旧 Redis 缓存的后端行为，显式禁用时不读取缓存。"""
+        backend = _client_backend(self.client)
+        return (backend.name == "redis" and backend.redis_auxiliary_default
+                and getattr(self.client, "redis_auxiliary_enabled", True))
 
     def register_callback(self, callback):
         self.callback = callback
@@ -3173,6 +3171,9 @@ class BigQmtXtTrader:
         if self._event_thread is not None and self._event_thread.is_alive():
             return
         self._event_running = True
+        # 显式再次启动是用户处理故障后的恢复动作，后台循环不能自行重复副作用回调。
+        self._push_callback_failed = False
+        self._push_listener_error = ""
         self._event_thread = threading.Thread(
             target=self._event_loop, name="bigqmt-exec-events", daemon=True
         )
@@ -3231,7 +3232,7 @@ class BigQmtXtTrader:
 
     def _build_quote_push_channel(self):
         """构造交易回报订阅通道；交易类不能依赖仅在行情类上定义的方法。"""
-        return _build_client_push_channel(self.client)
+        return _build_client_push_channel(self.client, subscriber_role="exec")
 
     def _event_loop_push_channel(self):
         """监听一轮 ZMQ 执行事件；账户切换或通道失败后重新选择传输。"""
@@ -3287,7 +3288,7 @@ class BigQmtXtTrader:
             redis_client = self._exec_events_redis_or_none()
             if redis_client is not None:
                 self._event_loop_redis(redis_client)
-            elif self._exec_transport_is_zmq():
+            elif self._exec_transport_uses_push():
                 self._event_loop_push_channel()
             else:
                 # redis transport with redis down: nothing else carries
@@ -3295,15 +3296,20 @@ class BigQmtXtTrader:
                 time.sleep(1.0)
 
     def _exec_transport_is_zmq(self):
+        """保留历史判断入口，仅供旧调用方判断 ZMQ 名称。"""
         return str(getattr(self.client, "transport_name", "redis") or "redis").lower() == "zmq"
 
-    def _exec_events_redis_or_none(self):
-        """A REACHABLE Redis client for the exec-event channels, or None.
+    def _exec_transport_uses_push(self):
+        """按固定后端能力选择推送，Redis 故障时不转入同样依赖 Redis 的通道。"""
+        backend = _client_backend(self.client)
+        if backend.push_depends_on_redis and getattr(self.client, "redis_auxiliary_enabled", True):
+            return False
+        return backend.execution_events_via_push
 
-        _redis() only builds the client object; the connection is lazy, so
-        an unreachable server would still return one. Ping it -- the channel
-        choice must reflect reachability, not configuration.
-        """
+    def _exec_events_redis_or_none(self):
+        """仅在未禁用且实际可达时返回 Redis 回报通道，避免建立多余连接。"""
+        if not getattr(self.client, "redis_auxiliary_enabled", True):
+            return None
         try:
             client = self.client._redis()
             if client is None:
@@ -3377,6 +3383,7 @@ class BigQmtXtTrader:
         except Exception:
             pass  # 屏障故障绝不能吞掉事件
         self._deliver_event(event)
+
 
     def _deliver_event(self, event):
         callback = self.callback
@@ -4167,22 +4174,11 @@ class BigQmtXtTrader:
                 self._submit_async_batch(account_id, group)
 
     def _submit_async_batch(self, account_id, group):
-        """Submit a same-account backlog in one RPC, one outcome per job.
+        """同账户积压只发一批，每单异步返回结果，不在批量路径等待合同号。
 
-        wait_settlement=False on every item, deliberately. It is what the async
-        contract already asks for (#69), and it also sidesteps a latent bug in
-        the batch handler: _handle_submit_order defaults the flag to True and
-        parks each item's settlement in the single _pending_settlement slot, so
-        only the last item of a batch would ever get its order id backfilled.
-
-        Fallbacks, and when they are allowed: a batch whose outcome is UNKNOWN
-        (timeout, connection drop) must NOT be resubmitted -- the server may
-        still be running it, and the resubmit doubles the orders (live: a
-        100-item batch outlived the 30s timeout, the fallback resubmitted, and
-        200 orders landed). Only two failure shapes may fall back to
-        one-at-a-time: the server REPLIED with an error (the handler raises
-        before its per-item loop, so nothing ran), and an empty result list
-        (the handler appends one entry per item, so empty means it never ran).
+        group 保存各单序号、原参数和字段；明确 outcome_unknown=True 的错误回复
+        与传输失败均不能逐单重报。False 及旧服务未声明的 None 保留历史拒绝回退。
+        wait_settlement=False 避免逐单阻塞，也避免旧处理器只有最后一单保留结算槽。
         """
         payload = []
         for (seq, args, kwargs), fields in group:
@@ -4207,23 +4203,15 @@ class BigQmtXtTrader:
             results = self.order_stock_batch(account_id, payload,
                                              idempotent=False) or []
         except RpcServerRepliedError as exc:
+            if exc.outcome_unknown is True:
+                # 响应编码等错误发生在业务完成之后，收到错误包仍可能已有真实委托。
+                self._enqueue_unknown_batch_outcomes(group, exc)
+                return
             log.warning("async batch of %d refused by the server (%s); "
                         "submitting one at a time", len(group), exc)
             results = None
         except Exception as exc:
-            # Timeout / transport failure: the batch's fate is unknown. Do NOT
-            # resubmit -- report each item as unknown-outcome instead. The
-            # message must say the orders may be live, because they may be:
-            # a caller that retries on failure double-orders.
-            log.exception("async batch of %d outcome unknown; NOT resubmitting",
-                          len(group))
-            for (seq, args, kwargs), fields in group:
-                self._enqueue_batch_outcome(seq, fields, {
-                    "success": False, "code": -4,
-                    "error": ("batch outcome unknown (%s: %s); the orders MAY "
-                              "BE LIVE -- query orders before retrying"
-                              % (exc.__class__.__name__, exc)),
-                })
+            self._enqueue_unknown_batch_outcomes(group, exc)
             return
         if not results:
             if results is not None:
@@ -4246,14 +4234,32 @@ class BigQmtXtTrader:
         for index, ((seq, args, kwargs), fields) in enumerate(group):
             self._enqueue_batch_outcome(seq, fields, by_index.get(index))
 
-    def _enqueue_batch_outcome(self, seq, fields, entry):
-        """Translate one item of a batch result into that job's outcome unit.
+    def _enqueue_unknown_batch_outcomes(self, group, error):
+        """为不能自动重报的批次逐单产生 -4 回报，保留原请求编号供查询核对。
 
-        The per-order wait for a late order id is NOT done for batch items.
-        Serially waiting up to ASYNC_SYSID_WAIT_SECONDS on each of N items
-        would undo the batch: 300 orders would spend 600s waiting instead of
-        0.6s submitting. Items whose id is not back yet answer with the remark,
-        and the real id still arrives on the order_callback push like any other.
+        group 为 ((seq, args, kwargs), fields) 列表；error 是保留原传输语义的异常。
+        """
+        request_id = getattr(error, "request_id", None)
+        unknown = getattr(error, "outcome_unknown", None)
+        unknown = True if unknown is None else unknown
+        detail = "batch outcome unknown (%s: %s)" % (type(error).__name__, error)
+        if request_id is not None:
+            detail += "; request_id=%s" % request_id
+        detail += "; the orders MAY BE LIVE -- query orders before retrying"
+        log.error("async batch of %d outcome unknown; request_id=%r; NOT resubmitting: %s",
+                  len(group), request_id, error)
+        for (seq, args, kwargs), fields in group:
+            self._enqueue_batch_outcome(seq, fields, {
+                "success": False, "code": -4, "error": detail,
+                "request_id": request_id, "outcome_unknown": unknown,
+                "error_code": getattr(error, "error_code", ""),
+            })
+
+    def _enqueue_batch_outcome(self, seq, fields, entry):
+        """将批量单项 entry 转为 seq 对应回报，fields 保留原单的代码和备注。
+
+        批量路径不逐单等待合同号，否则会抵消批量吞吐；真实编号仍由委托推送学习。
+        错误回报携带原请求编号及显式结果确定性，便于调用方对账且避免盲目重报。
         """
         remark = str(fields.get("order_remark") or "")
         stock_code = str(fields.get("stock_code") or "")
@@ -4266,6 +4272,9 @@ class BigQmtXtTrader:
                 "error_id": int(entry.get("code") or -1),
                 "error_msg": str(entry.get("error")
                                  or "order missing from batch result"),
+                "request_id": entry.get("request_id"),
+                "outcome_unknown": entry.get("outcome_unknown"),
+                "error_code": entry.get("error_code", ""),
             })
             return
         order_sys_id = str(entry.get("order_sys_id") or "")
@@ -4357,6 +4366,9 @@ class BigQmtXtTrader:
                             stock_code=unit["stock_code"],
                             seq=seq,
                             order_remark=unit["order_remark"],
+                            request_id=unit.get("request_id"),
+                            outcome_unknown=unit.get("outcome_unknown"),
+                            error_code=unit.get("error_code", ""),
                         )
                     )
             elif callback is not None:

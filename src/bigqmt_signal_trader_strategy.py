@@ -565,41 +565,18 @@ def _is_redis_transport(transport_name):
 
 
 def _resolve_background_threads(transport_name, configured):
-    """Decide whether the RPC service runs its own background receive threads.
+    """按后端能力选择接收线程；可传启动时固定的定义或兼容名称。"""
+    from bigqmt_signal_trader.transports.backend import CommunicationBackend, get_backend
 
-    ``configured`` is None when the local config never set
-    ``rpc_background_threads`` (the runtime only forwards the key when it was
-    given explicitly) -- that case keeps the historical default: background
-    receiver threads on for every transport.
-
-    An explicit False opts into the adjust-driven drain instead: the transport
-    is polled with a non-blocking recv from drain_request_queue on each adjust
-    tick, and the reply is sent on the adjust thread too. That removes every
-    cross-thread handoff from the round trip -- measured on the live terminal,
-    each time a background thread acquires the GIL costs ~1 adjust tick
-    (~100ms), which is where the round trip actually goes (#104).
-
-    Only zmq/mysql implement drain_request_queue, so only they honor the
-    override; anything else keeps the receiver thread it needs to be polled by.
-    Redis honors either value (blocking brpop path AND an adjust lpop drain).
-    """
-    normalized = str(transport_name or "redis").lower()
-    if _is_redis_transport(normalized):
-        return bool(configured)
+    backend = transport_name if isinstance(transport_name, CommunicationBackend) else get_backend(transport_name)
     if configured is None:
-        return True
-    if normalized in ("zmq", "mysql"):
-        return bool(configured)
-    return True
+        return backend.default_background_threads
+    # 不支持回调轮询的后端不能关闭接收线程，否则请求会一直无人处理。
+    return bool(configured) if backend.supports_scheduler_polling else True
 
 
-def _build_quote_subscription_service(context_info, config, transport_name, account_id, redis_client):
-    """Assemble the server-side whole-quote push service (manager + channel).
-
-    Returns ``(manager, channel)`` or ``None`` when disabled. The channel publisher
-    is started in ``_start_rpc_service`` once the RPC service is up; the manager's
-    reaper is fed from ``_drain_rpc_service``.
-    """
+def _build_quote_subscription_service(context_info, config, transport_name, account_id, redis_client, backend=None):
+    """按通信后端组装推送通道，调用方负责启动发布端和清理过期订阅。"""
     quote_config = dict(config.get("quote_push") or {})
     enabled = _config_bool(quote_config.get("enabled"), True)
     if not enabled:
@@ -621,16 +598,21 @@ def _build_quote_subscription_service(context_info, config, transport_name, acco
         zmq_bind_address=zmq_bind_address,
         enabled=True,
         heartbeat_timeout_seconds=heartbeat_timeout,
+        rpc_config=dict(config.get("rpc") or {}),
+        backend=backend,
     )
 
 
 def _build_rpc_service(context_info, app, config):
+    """使用同一后端定义组装 RPC、推送与处理器，保留原业务权限检查。"""
     rpc_config = dict(config.get("rpc") or {})
     enabled = _config_bool(config.get("enable_rpc"), False) or _config_bool(rpc_config.get("enabled"), False)
     if not enabled:
         return None
-    transport_name = str(rpc_config.get("transport") or "redis").lower()
-    redis_transport = transport_name in ("redis", "", "default")
+    from bigqmt_signal_trader.transports.backend import get_backend
+
+    backend = get_backend(rpc_config.get("transport"))
+    transport_name = backend.name
 
     import importlib
     if _load_bridge_module is not None:
@@ -664,175 +646,174 @@ def _build_rpc_service(context_info, app, config):
     BigQmtPositionProvider = _position_bigqmt.BigQmtPositionProvider
 
     qmt_api = dict(config.get("qmt_api") or {})
-    redis_client = None
-    response_redis_client = None
-    if redis_transport:
-        if _load_bridge_module is not None:
-            _redis_common = _load_bridge_module("bigqmt_signal_trader.adapters.redis_common")
-        else:
-            from bigqmt_signal_trader.adapters import redis_common as _redis_common
-
-        _redis_common = importlib.reload(_redis_common)
-        redis_config = dict(config.get("redis") or {})
-        redis_config.update(dict(rpc_config.get("redis") or {}))
-        listen_redis_config = dict(redis_config)
-        # Never use socket_timeout=None on the listen client: the same client also
-        # serves the adjust-thread LPOP drain, and a None timeout makes a hung
-        # (not refused) redis block the QMT main thread forever. brpop's own 1s
-        # command timeout is unaffected by a bounded socket timeout.
-        if listen_redis_config.get("socket_timeout") in (None, ""):
-            listen_redis_config["socket_timeout"] = 10
-        redis_client = rpc_config.get("redis_client") or config.get("redis_client") or _redis_common.build_redis_client(listen_redis_config)
-        response_redis_client = (
-            rpc_config.get("response_redis_client")
-            or config.get("response_redis_client")
-            or _redis_common.build_redis_client(redis_config)
-        )
     account_id = str(rpc_config.get("account_id") or config.get("account_id") or _account_id or "")
     if not account_id:
         print("[bigqmt_rpc] disabled: account_id is empty")
         return None
-    allow_order_methods = _config_bool(rpc_config.get("allow_order_methods"), False)
-    global _quote_subscription_service
-    _quote_subscription_service = _build_quote_subscription_service(
-        context_info, config, transport_name, account_id, redis_client
-    )
-    quote_manager = (
-        _quote_subscription_service[0] if _quote_subscription_service is not None else None
-    )
-    handlers = BigQmtRpcHandlers(
-        account_id=account_id,
-        market_data=BigQmtMarketDataProvider(context_info, qmt_api=qmt_api),
-        position_provider=BigQmtPositionProvider(
-            get_trade_detail_data_func=qmt_api.get("get_trade_detail_data"),
-            account_type=config.get("account_type", "STOCK"),
-        ),
-        order_gateway=getattr(app, "order_gateway", None),
-        position_sync_sink=getattr(app, "position_sync_sink", None),
-        allow_order_methods=allow_order_methods,
-        allowed_methods=rpc_config.get("allowed_methods"),
-        qmt_api=qmt_api,
-        # Async settlement keeps passorder off the adjust thread's critical
-        # path; set rpc_settle_orders_inline=True only for a runtime with no
-        # adjust drain to retry on.
-        settle_orders_inline=_config_bool(rpc_config.get("settle_orders_inline"), False),
-        order_settle_timeout_seconds=float(rpc_config.get("order_settle_timeout_seconds", 3.0)),
-        quote_subscription_manager=quote_manager,
-        # .get(key) not .get(key, default): "" is a real answer here (leave
-        # 报单来源 blank), and a default would swallow it -- issue #154.
-        default_strategy_name=rpc_config.get("default_strategy_name"),
-    )
-    # Neither of these may depend on the TRANSPORT. Only a redis transport
-    # builds the two clients above, so on zmq both were None -- and each had a
-    # working counterpart on the other side of that None:
-    #
-    #   download jobs   _pump_download_jobs advances queued jobs on every
-    #                   adjust tick and takes its client from _exec_event_redis,
-    #                   so on zmq the worker ran while submit / get_status /
-    #                   wait answered "download jobs require a Redis client".
-    #                   The worker was running and the door was locked.
-    #   order identity  orders were never remembered at submit time, so a query
-    #                   could never put the strategy name back (issue #133).
-    #
-    # _exec_event_redis is the helper that already covers this case ("only
-    # builds a client when _rpc_service has none, which is the zmq-transport
-    # case") and caches it -- its docstring says what building one per call
-    # cost. No redis configured at all leaves both None, and both stores treat
-    # that as "feature off", never as an error.
-    _store_redis = response_redis_client or redis_client or _exec_event_redis(config)
-    handlers.download_job_redis_client = _store_redis
-    handlers.order_identity_redis_client = _store_redis
-    # Settlement reads the callback-fed watch table first (issue #164).
-    handlers.order_watch_table = _order_watch_table
-    # Whether _pump_download_jobs will actually run queued jobs. The submit RPC
-    # needs it: with the redis client now wired on every transport, a submit
-    # would otherwise be accepted into a queue that nothing drains.
-    # Lets reload_deployment re-import the package and re-run init without a
-    # strategy restart. The handlers cannot reach this module's own functions
-    # any other way.
-    handlers.reload_hook = request_reload
-    handlers.reload_status_hook = reload_status
-    handlers.download_jobs_enabled = _config_bool(
-        (config.get("download_jobs") or {}).get("enabled"), False)
-    handlers.download_job_chunk_size = int((config.get("download_jobs") or {}).get("chunk_size") or 10)
-    handlers.download_job_ttl_seconds = int((config.get("download_jobs") or {}).get("job_ttl_seconds") or 3600)
-    process_in_listener = _config_bool(rpc_config.get("process_in_listener"), True)
-    listener_methods = rpc_config.get("listener_methods") or ("*",)
-    # None when the runtime did not forward the key (local config never set
-    # rpc_background_threads): the resolver then keeps the historical default.
-    configured_bg = rpc_config.get("background_threads")
-    if configured_bg is not None:
-        configured_bg = _config_bool(configured_bg, False)
-    background_threads = _resolve_background_threads(transport_name, configured_bg)
-    if background_threads and not configured_bg:
-        print("[bigqmt_rpc] transport=%s -> background_threads auto-enabled" % transport_name)
-    # Build the transport. Redis is the default and reuses the existing clients/
-    # templates (zero behavior change). zmq/mysql/shm go through the factory and
-    # bypass the Redis clients entirely.
-    transport = None
-    if transport_name not in ("redis", "", "default"):
-        if _load_bridge_module is not None:
-            build_transport = _load_bridge_module("bigqmt_signal_trader.transports.factory").build_transport
-        else:
-            from bigqmt_signal_trader.transports.factory import build_transport
-
-        factory_config = dict(rpc_config)
-        factory_config["account_id"] = account_id
-        factory_config["print_prefix"] = "[bigqmt_rpc]"
-        transport = build_transport(transport_name, factory_config, account_id=account_id, print_prefix="[bigqmt_rpc]")
-    print(
-        "[bigqmt_rpc] transport=%s mode process_in_listener=%s listener_methods=%s allow_order_methods=%s background_threads=%s"
-        % (transport_name, process_in_listener, listener_methods, allow_order_methods, background_threads)
-    )
-    service = RedisPubSubRpcService(
-        redis_client=redis_client,
-        response_redis_client=response_redis_client,
-        handlers=handlers,
-        account_id=account_id,
-        request_channel_template=rpc_config.get("request_channel_template", "bigqmt:rpc:req:{account_id}"),
-        response_channel_template=rpc_config.get("response_channel_template", "bigqmt:rpc:resp:{account_id}:{request_id}"),
-        response_key_template=rpc_config.get("response_key_template", "bigqmt:rpc:resp:{account_id}:{request_id}"),
-        response_ttl_seconds=int(rpc_config.get("response_ttl_seconds", 60)),
-        max_queue_size=int(rpc_config.get("max_queue_size", 200)),
-        process_in_listener=process_in_listener,
-        listener_methods=listener_methods,
-        background_threads=background_threads,
-        debug_log_limit=int(rpc_config.get("debug_log_limit", 5)),
-        transport=transport,
-    )
-    # Multi-account: when BIGQMT_ACCOUNT_TYPE_MAP has multiple entries,
-    # build one RPC service per account sharing the same handlers.
+    factory_config = dict(rpc_config)
+    factory_config["server_side"] = True
+    factory_config["redis"] = dict(config.get("redis") or {}, **dict(rpc_config.get("redis") or {}))
+    for key in ("redis_client", "response_redis_client"):
+        if factory_config.get(key) is None and config.get(key) is not None:
+            factory_config[key] = config[key]
+    transport = backend.build_rpc_transport(factory_config, account_id=account_id, print_prefix="[bigqmt_rpc]")
     try:
-        from bigqmt_signal_trader.multi_account import build_multi_account_rpc_service
-        multi_service = build_multi_account_rpc_service(
-            context_info, app, config,
-            # The single-service builder: reuse everything we just built
-            # as the primary, and let build_multi_account_rpc_service
-            # create secondary services if the map has more entries.
-            lambda ctx, app, cfg: service if ctx is context_info else None,
+        # 旧 Redis 存储功能复用后端已有连接；其它后端不因此创建 Redis RPC 资源。
+        redis_client = getattr(transport, "listen_redis", None)
+        response_redis_client = getattr(transport, "redis", None)
+        allow_order_methods = _config_bool(rpc_config.get("allow_order_methods"), False)
+        global _quote_subscription_service
+        communication_config = dict(config, rpc=factory_config)
+        _quote_subscription_service = _build_quote_subscription_service(
+            context_info, communication_config, transport_name, account_id, redis_client, backend=backend,
         )
-        if multi_service is not service:
-            # Multi-account mode: wrapped in MultiAccountRpcServiceManager
-            return multi_service
-    except Exception as _ma_err:
-        print("[bigqmt_rpc] multi_account check failed (single-account fallback): %s" % _ma_err)
-    return service
+        quote_manager = (
+            _quote_subscription_service[0] if _quote_subscription_service is not None else None
+        )
+        handlers = BigQmtRpcHandlers(
+            account_id=account_id,
+            market_data=BigQmtMarketDataProvider(context_info, qmt_api=qmt_api),
+            position_provider=BigQmtPositionProvider(
+                get_trade_detail_data_func=qmt_api.get("get_trade_detail_data"),
+                account_type=config.get("account_type", "STOCK"),
+            ),
+            order_gateway=getattr(app, "order_gateway", None),
+            position_sync_sink=getattr(app, "position_sync_sink", None),
+            allow_order_methods=allow_order_methods,
+            allowed_methods=rpc_config.get("allowed_methods"),
+            qmt_api=qmt_api,
+            # Async settlement keeps passorder off the adjust thread's critical
+            # path; set rpc_settle_orders_inline=True only for a runtime with no
+            # adjust drain to retry on.
+            settle_orders_inline=_config_bool(rpc_config.get("settle_orders_inline"), False),
+            order_settle_timeout_seconds=float(rpc_config.get("order_settle_timeout_seconds", 3.0)),
+            quote_subscription_manager=quote_manager,
+            # .get(key) not .get(key, default): "" is a real answer here (leave
+            # 报单来源 blank), and a default would swallow it -- issue #154.
+            default_strategy_name=rpc_config.get("default_strategy_name"),
+        )
+        # Neither of these may depend on the TRANSPORT. Only a redis transport
+        # builds the two clients above, so on zmq both were None -- and each had a
+        # working counterpart on the other side of that None:
+        #
+        #   download jobs   _pump_download_jobs advances queued jobs on every
+        #                   adjust tick and takes its client from _exec_event_redis,
+        #                   so on zmq the worker ran while submit / get_status /
+        #                   wait answered "download jobs require a Redis client".
+        #                   The worker was running and the door was locked.
+        #   order identity  orders were never remembered at submit time, so a query
+        #                   could never put the strategy name back (issue #133).
+        #
+        # _exec_event_redis is the helper that already covers this case ("only
+        # builds a client when _rpc_service has none, which is the zmq-transport
+        # case") and caches it -- its docstring says what building one per call
+        # cost. No redis configured at all leaves both None, and both stores treat
+        # that as "feature off", never as an error.
+        _store_redis = None
+        if _config_bool(rpc_config.get("redis_enabled"), True):
+            _store_redis = response_redis_client or redis_client or _exec_event_redis(config)
+        handlers.download_job_redis_client = _store_redis
+        handlers.order_identity_redis_client = _store_redis
+        # Settlement reads the callback-fed watch table first (issue #164).
+        handlers.order_watch_table = _order_watch_table
+        # Whether _pump_download_jobs will actually run queued jobs. The submit RPC
+        # needs it: with the redis client now wired on every transport, a submit
+        # would otherwise be accepted into a queue that nothing drains.
+        # Lets reload_deployment re-import the package and re-run init without a
+        # strategy restart. The handlers cannot reach this module's own functions
+        # any other way.
+        handlers.reload_hook = request_reload
+        handlers.reload_status_hook = reload_status
+        handlers.download_jobs_enabled = _config_bool(
+            (config.get("download_jobs") or {}).get("enabled"), False)
+        handlers.download_job_chunk_size = int((config.get("download_jobs") or {}).get("chunk_size") or 10)
+        handlers.download_job_ttl_seconds = int((config.get("download_jobs") or {}).get("job_ttl_seconds") or 3600)
+        process_in_listener = _config_bool(rpc_config.get("process_in_listener"), True)
+        listener_methods = rpc_config.get("listener_methods") or ("*",)
+        # None when the runtime did not forward the key (local config never set
+        # rpc_background_threads): the resolver then keeps the historical default.
+        configured_bg = rpc_config.get("background_threads")
+        if configured_bg is not None:
+            configured_bg = _config_bool(configured_bg, False)
+        background_threads = _resolve_background_threads(backend, configured_bg)
+        if background_threads and not configured_bg:
+            print("[bigqmt_rpc] transport=%s -> background_threads auto-enabled" % transport_name)
+        print(
+            "[bigqmt_rpc] transport=%s mode process_in_listener=%s listener_methods=%s allow_order_methods=%s background_threads=%s"
+            % (transport_name, process_in_listener, listener_methods, allow_order_methods, background_threads)
+        )
+        service = RedisPubSubRpcService(
+            redis_client=redis_client,
+            response_redis_client=response_redis_client,
+            handlers=handlers,
+            account_id=account_id,
+            request_channel_template=rpc_config.get("request_channel_template", "bigqmt:rpc:req:{account_id}"),
+            response_channel_template=rpc_config.get("response_channel_template", "bigqmt:rpc:resp:{account_id}:{request_id}"),
+            response_key_template=rpc_config.get("response_key_template", "bigqmt:rpc:resp:{account_id}:{request_id}"),
+            response_ttl_seconds=int(rpc_config.get("response_ttl_seconds", 60)),
+            max_queue_size=int(rpc_config.get("max_queue_size", 200)),
+            process_in_listener=process_in_listener,
+            listener_methods=listener_methods,
+            background_threads=background_threads,
+            debug_log_limit=int(rpc_config.get("debug_log_limit", 5)),
+            transport=transport,
+        )
+        service.communication_backend = backend
+        # Multi-account: when BIGQMT_ACCOUNT_TYPE_MAP has multiple entries,
+        # build one RPC service per account sharing the same handlers.
+        try:
+            from bigqmt_signal_trader.multi_account import build_multi_account_rpc_service
+            multi_service = build_multi_account_rpc_service(
+                context_info, app, config,
+                # The single-service builder: reuse everything we just built
+                # as the primary, and let build_multi_account_rpc_service
+                # create secondary services if the map has more entries.
+                lambda ctx, app, cfg: service if ctx is context_info else None,
+            )
+            if multi_service is not service:
+                # Multi-account mode: wrapped in MultiAccountRpcServiceManager
+                return multi_service
+        except Exception as _ma_err:
+            print("[bigqmt_rpc] multi_account check failed (single-account fallback): %s" % _ma_err)
+        return service
+    except Exception:
+        # 已取得的 RPC 通道在组装异常时也必须释放，不能等到 start 才登记清理。
+        try:
+            transport.stop()
+        except Exception:
+            pass
+        raise
 
 
 def _start_rpc_service(context_info, app, config):
-    global _rpc_service
+    """成套启动 RPC 与推送，任一阶段失败都回收资源并允许重新启动。"""
+    global _rpc_service, _quote_subscription_service
     if _rpc_service is not None:
         return _rpc_service
-    _rpc_service = _build_rpc_service(context_info, app, config)
-    if _rpc_service is not None:
-        _rpc_service.start()
-        if _quote_subscription_service is not None:
-            try:
+    try:
+        _rpc_service = _build_rpc_service(context_info, app, config)
+        if _rpc_service is not None:
+            _rpc_service.start()
+            if _quote_subscription_service is not None:
                 _quote_subscription_service[1].start_publisher()
                 print("[bigqmt_quote_push] publisher started transport=%s"
                       % str(dict(config.get("rpc") or {}).get("transport") or "redis"))
-            except Exception as exc:
-                _log_err("quote_push", "publisher start failed: %s" % exc)
+    except Exception:
+        service, quote_service = _rpc_service, _quote_subscription_service
+        _rpc_service = None
+        _quote_subscription_service = None
+        # 不让清理错误掩盖首次启动失败，也不留下可被误认成健康的全局实例。
+        if service is not None:
+            try:
+                service.stop()
+            except Exception:
+                pass
+        if quote_service is not None:
+            try:
+                quote_service[1].stop()
+            except Exception:
+                pass
+        raise
     return _rpc_service
 
 
@@ -851,6 +832,10 @@ def _drain_rpc_service(config):
         except Exception as exc:
             _log_err("quote_push", "reap failed: %s" % exc)
     return processed
+
+
+
+
 
 
 def _refresh_full_tick_cache(context_info, config):
@@ -1668,17 +1653,15 @@ def _publish_one(exec_events, sink, account_id, event, kind, config):
 
 
 def _exec_event_redis(config):
-    """Return a redis client for exec-event publishing, reusing one instance.
+    """复用辅助 Redis 连接；显式禁用优先于已有缓存和残留连接参数。
 
-    Previously a new client was built per order/trade callback when the RPC
-    service had none (the zmq-transport case), leaking a connection pool per
-    event. Reuse one; build failure returns None so publishing just skips.
-
-    A non-Redis transport may retain a Redis block for optional download jobs
-    or exec-event replay. Skip that block only when both consumers are
-    explicitly disabled; omitted flags retain the legacy enabled behavior.
+    未禁用时保留下载任务、执行事件重放的旧行为，避免每次回调新建连接池。
     """
     global _exec_event_redis_client
+    from bigqmt_signal_trader.transports.backend import config_bool
+
+    if not config_bool((config.get("rpc") or {}).get("redis_enabled"), True):
+        return None
     existing = getattr(_rpc_service, "redis", None) if _rpc_service is not None else None
     if existing is not None:
         return existing

@@ -55,15 +55,21 @@ class RpcTransport(object):
         raise NotImplementedError
 
     # -- server side -------------------------------------------------------
-    def start_receiving(self, on_request):
-        """Begin accepting inbound requests on the server side.
+    def start_receiving(self, on_request, background_threads=True):
+        """登记请求回调；background_threads 指定是否使用后台接收线程。
 
-        ``on_request(request_dict)`` is invoked per inbound request and MUST
-        return the response dict. Implementations may spawn a background
-        thread. Safe to call once per transport instance.
+        回调返回响应字典时由 deliver 回复；返回 None 时允许业务层延后回复。
+        具体实现负责启动线程或准备由 QMT 策略回调轮询的资源。
         """
         self._on_request = on_request
         self._running = True
+
+    def drain_request_queue(self, max_items=20):
+        """非阻塞收取至多 max_items 条请求；纯后台接收实现默认为无操作。
+
+        声明 supports_scheduler_polling 的后端必须覆盖本方法，不能依赖此空实现。
+        """
+        return 0
 
     def send_response(self, request, response):
         """Deliver ``response`` back to the client that sent ``request``.

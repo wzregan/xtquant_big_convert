@@ -11,6 +11,7 @@ from .xtquant_compat import (
     BigQmtXtTrader,
     CompatObject,
     RpcServerRepliedError,
+    _AcknowledgedExecutionEvent,
     _account_id,
     log,
 )
@@ -220,7 +221,7 @@ class XtQuantTrader(BigQmtXtTrader):
         )
 
     def _deliver_event(self, event):
-        """错误回调同样使用整数编号，保持与查询、正常回调及撤单一致。"""
+        """错误回调保留整数编号，并在回调完成或失败后释放确认型推送的等待。"""
         kind = event.get("event_type")
         if kind not in ("order_error", "cancel_error"):
             return super(XtQuantTrader, self)._deliver_event(event)
@@ -250,8 +251,14 @@ class XtQuantTrader(BigQmtXtTrader):
                 else self.callback.on_cancel_error
             )
             handler(value)
-        except Exception:
+        except Exception as exc:
             log.exception("user callback failed: %s", kind)
+            if isinstance(event, _AcknowledgedExecutionEvent):
+                event.callback_error = exc
+        finally:
+            # 子类覆盖了错误回调分发，也必须履行基类的确认契约，不能吞掉失败后 ACK。
+            if isinstance(event, _AcknowledgedExecutionEvent):
+                event.completed.set()
 
     def _order_id(self, order_sys_id):
         """提交缺少合同号时结果未知；收到合同号后才生成可持久化的整数。"""

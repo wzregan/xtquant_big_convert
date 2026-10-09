@@ -12,5 +12,9 @@ See :mod:`~bigqmt_signal_trader.transports.factory`.
 
 from .base import RpcTransport, TransportError, TransportTimeout
 from .factory import build_transport
+from .backend import CommunicationBackend, get_backend, register_backend
 
-__all__ = ["RpcTransport", "TransportError", "TransportTimeout", "build_transport"]
+__all__ = [
+    "RpcTransport", "TransportError", "TransportTimeout", "build_transport",
+    "CommunicationBackend", "get_backend", "register_backend",
+]

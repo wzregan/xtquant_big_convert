@@ -26,6 +26,7 @@ import inspect
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -54,15 +55,13 @@ class WiringTest(unittest.TestCase):
             "or _exec_event_redis(config)", self.source)
 
     def test_it_does_not_build_a_second_client_of_its_own(self):
-        """_exec_event_redis caches; a private builder would not.
-
-        (build_redis_client does appear in _build_rpc_service -- that is the
-        redis-transport branch above, which is fine and predates this.)
-        """
-        self.assertNotIn("_store_redis = ", self.source.replace(
-            "_store_redis = response_redis_client or redis_client "
-            "or _exec_event_redis(config)", ""))
-        self.assertFalse(hasattr(strategy, "_build_identity_redis_client"))
+        """重复取得辅助存储必须复用同一连接，避免每个回调新建连接池。"""
+        cached = FakeRedis()
+        with patch.object(strategy, "_exec_event_redis_client", None), patch.object(strategy, "_rpc_service", None), patch("bigqmt_signal_trader.adapters.redis_common.build_redis_client", return_value=cached) as create:
+            config = {"redis": {"host": "configured.test"}}
+            self.assertIs(strategy._exec_event_redis(config), cached)
+            self.assertIs(strategy._exec_event_redis(config), cached)
+            create.assert_called_once()
 
     def test_the_pump_uses_the_same_helper(self):
         """Which is why the worker was running while the door was locked."""

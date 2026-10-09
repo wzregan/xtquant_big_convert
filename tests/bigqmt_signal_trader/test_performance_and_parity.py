@@ -79,15 +79,17 @@ def test_server_only_uses_compact_format_when_requested(wire_format):
 @pytest.mark.parametrize("transport_name", ["redis", "zmq"])
 def test_client_negotiates_only_decodable_format_and_accepts_old_server(has_pandas, transport_name):
     """轻量客户端不协商按列格式；新客户端可继续消费旧服务端响应。"""
-    client = BigQmtRpcClient(account_id="acct")
+    client = BigQmtRpcClient(account_id="acct", transport=transport_name, redis_client=object())
     client._formula_router = lambda: SimpleNamespace(supports=lambda _: False)
     old_response = {"ok": True, "data": {"__bigqmt_type__": "DataFrame", "columns": ["close"], "records": [[1.0]]}}
-    transport = SimpleNamespace(send_request=Mock(return_value=old_response))
-    client._transport = lambda: transport if transport_name == "zmq" else None
-    client._redis = lambda: None
-    with patch("bigqmt_signal_trader.xtquant_compat.importlib.util.find_spec", return_value=object() if has_pandas else None), patch("bigqmt_signal_trader.xtquant_compat.call_redis_rpc", return_value=old_response) as redis_call:
-        frame = client.call("get_market_data")
-    request = transport.send_request.call_args[0][0] if transport_name == "zmq" else redis_call.call_args[1]
+    # 两种后端都经过真实工厂，只替换网络收发，验证格式协商与旧响应兼容。
+    transport = client._transport()
+    try:
+        with patch("bigqmt_signal_trader.xtquant_compat.importlib.util.find_spec", return_value=object() if has_pandas else None), patch.object(transport, "send_request", return_value=old_response) as send:
+            frame = client.call("get_market_data")
+        request = send.call_args[0][0]
+    finally:
+        transport.stop()
     assert request["dataframe_format"] == ("columns_v1" if has_pandas else "records")
     assert frame["close"].tolist() == [1.0]
 

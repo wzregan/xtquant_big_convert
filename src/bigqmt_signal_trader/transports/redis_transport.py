@@ -58,6 +58,7 @@ def _loads(raw_payload):
 
 
 def _is_redis_timeout(exc):
+    """识别 Redis 套接字读超时，允许在同一次请求的总等待窗口内继续收取。"""
     name = exc.__class__.__name__.lower()
     module = getattr(exc.__class__, "__module__", "")
     text = str(exc).lower()
@@ -122,15 +123,13 @@ class RedisTransport(RpcTransport):
 
     # -- client side -------------------------------------------------------
     def send_request(self, request, timeout_seconds, transport="queue"):
-        """Send ``request`` and block for the response dict.
+        """发送请求并等待响应；timeout_seconds 是秒，transport 选择 queue 或 pubsub。
 
-        ``transport`` selects the Redis sub-transport: ``"queue"`` (default,
-        RPUSH+BLPOP) or ``"pubsub"`` (PUBLISH+subscribe). Kept for parity with
-        the original ``call_redis_rpc`` signature.
+        请求内的账号覆盖实例默认账号，供同一客户端按请求切换查询账号。
         """
         return _call_redis_rpc(
             self.listen_redis,
-            self.account_id,
+            request.get("account_id") or self.account_id,
             request,
             timeout_seconds=float(timeout_seconds),
             transport=transport,
@@ -139,6 +138,7 @@ class RedisTransport(RpcTransport):
             response_channel_template=self.response_channel_template,
             response_list_template=self.response_list_template,
             response_key_template=self.response_key_template,
+            ttl_seconds=self.response_ttl_seconds,
         )
 
     # -- server side -------------------------------------------------------
@@ -370,43 +370,66 @@ def _call_redis_rpc(
     response_key_template=RESPONSE_KEY_TEMPLATE,
     ttl_seconds=60,
 ):
-    """Client-side round trip. Accepts a pre-built request envelope."""
+    """收发完整请求信封；超时和 TTL 均以秒计，沿用旧客户端的等待及解码行为。"""
+    # 延迟导入，避免服务模块构造传输对象时形成初始化依赖环。
+    from ..redis_rpc import loads_rpc_response
+
     request_id = request.get("request_id") or uuid.uuid4().hex
     request_channel = request_channel_template.format(account_id=account_id)
     request_queue = request_queue_template.format(account_id=account_id)
-    response_channel = response_channel_template.format(
-        account_id=account_id, request_id=request_id
-    )
-    response_list = response_list_template.format(account_id=account_id, request_id=request_id)
-    response_key = response_key_template.format(account_id=account_id, request_id=request_id)
-    # Ensure reply routing is present (the original helper filled these in).
+    response_channel = request.get("reply_channel") or _format(
+        response_channel_template, account_id, request_id)
+    response_list = request.get("reply_list") or _format(
+        response_list_template, account_id, request_id)
+    response_key = request.get("reply_key") or _format(
+        response_key_template, account_id, request_id)
+    ttl_seconds = request.get("ttl_seconds", ttl_seconds)
+    # 收取响应的地址必须与发给服务端的提示一致；复制信封，避免污染调用者。
     request = dict(request)
-    request.setdefault("request_id", request_id)
-    request.setdefault("reply_channel", response_channel)
-    request.setdefault("reply_list", response_list)
-    request.setdefault("reply_key", response_key)
-    request.setdefault("ttl_seconds", ttl_seconds)
     request["request_id"] = request_id
+    request["account_id"] = account_id
+    request["reply_channel"] = response_channel
+    request["reply_list"] = response_list
+    request["reply_key"] = response_key
+    request["ttl_seconds"] = ttl_seconds
     payload = encode_rpc_request_payload(request)
 
     if str(transport or "queue").lower() in ("queue", "list", "blpop"):
         redis_client.rpush(request_queue, payload)
         redis_client.expire(request_queue, max(60, int(ttl_seconds)))
-        wait_timeout = max(1, int(float(timeout_seconds) + 0.999))
-        item = redis_client.blpop(response_list, timeout=wait_timeout)
-        if item:
-            raw_response = (
-                item[1] if isinstance(item, (list, tuple)) and len(item) >= 2 else item
-            )
+        deadline = time.time() + float(timeout_seconds)
+        while True:
+            # 服务端可能已写入键；直接读取避免再进入一次阻塞等待。
+            raw_response = redis_client.get(response_key)
+            if raw_response:
+                return loads_rpc_response(raw_response)
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            wait_timeout = max(1, int(min(remaining, 1.0) + 0.999))
             try:
-                redis_client.delete(response_list)
-            except Exception:
-                pass
-            return json.loads(decode_text(raw_response))
+                item = redis_client.blpop(response_list, timeout=wait_timeout)
+            except Exception as exc:
+                if _is_redis_timeout(exc):
+                    # 只继续收取，绝不重发请求，避免下单类操作被重复执行。
+                    continue
+                raise
+            if item:
+                raw_response = (
+                    item[1] if isinstance(item, (list, tuple)) and len(item) >= 2 else item
+                )
+                try:
+                    redis_client.delete(response_list)
+                except Exception:
+                    pass
+                return loads_rpc_response(raw_response)
         raw_response = redis_client.get(response_key)
         if raw_response:
-            return json.loads(decode_text(raw_response))
-        raise TransportTimeout("redis rpc timeout: %s" % request.get("method"))
+            return loads_rpc_response(raw_response)
+        raise TransportTimeout(
+            "redis rpc timeout: %s account_id=%s request_queue=%s"
+            % (request.get("method"), account_id, request_queue)
+        )
 
     pubsub = redis_client.pubsub(ignore_subscribe_messages=True)
     try:
@@ -420,12 +443,12 @@ def _call_redis_rpc(
             message = pubsub.get_message(timeout=remaining)
             if not message or message.get("type") != "message":
                 continue
-            response = json.loads(decode_text(message.get("data")))
+            response = loads_rpc_response(message.get("data"))
             if response.get("request_id") == request_id:
                 return response
         raw_response = redis_client.get(response_key)
         if raw_response:
-            return json.loads(decode_text(raw_response))
+            return loads_rpc_response(raw_response)
         raise TransportTimeout("redis rpc timeout: %s" % request.get("method"))
     finally:
         try:

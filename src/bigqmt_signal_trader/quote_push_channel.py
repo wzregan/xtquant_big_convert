@@ -58,24 +58,36 @@ def decode_push_payload(blob):
 
 
 class QuotePushChannel(object):
-    """Abstract push channel. Server side: ``start_publisher`` + ``publish``.
-    Client side: ``start_subscriber(topics, on_msg)``. A single instance may act
-    as publisher or subscriber depending on which start method is called."""
+    """行情与交易回报共用的推送接口，由调用方启动和关闭通道。"""
+
+    @property
+    def publisher_endpoint(self):
+        """返回诊断用发布端点，没有独立端点的后端返回空字符串。"""
+        return ""
 
     def start_publisher(self):
+        """启动服务端发布资源。"""
         raise NotImplementedError
 
     def start_subscriber(self, topics, on_msg):
+        """订阅主题，on_msg 接收主题和已解码的业务消息。"""
         raise NotImplementedError
 
     def publish(self, topic, data):
+        """发布主题消息，data 为规范化后的业务字典。"""
         raise NotImplementedError
 
     def stop(self):
+        """停止收发并释放本实例持有的资源。"""
         raise NotImplementedError
 
 
 class ZmqQuotePushChannel(QuotePushChannel):
+    @property
+    def publisher_endpoint(self):
+        """返回服务端发布地址，供订阅诊断使用。"""
+        return str(self.bind_address or "")
+
     def __init__(self, bind_address=None, connect_address=None, context=None, print_prefix="[bigqmt_quote_push]"):
         self.bind_address = bind_address
         self.connect_address = connect_address
@@ -99,11 +111,20 @@ class ZmqQuotePushChannel(QuotePushChannel):
 
     # -- server side ---------------------------------------------------------
     def start_publisher(self):
+        """创建发布套接字；绑定失败时立即释放尚未交给实例的资源。"""
         zmq, ctx = self._ensure_context()
         if not self.bind_address:
             raise ValueError("bind_address is required to start a publisher")
-        self._pub = ctx.socket(zmq.PUB)
-        self._pub.bind(self.bind_address)
+        pub = ctx.socket(zmq.PUB)
+        try:
+            pub.bind(self.bind_address)
+        except Exception:
+            try:
+                pub.close(linger=0)
+            except Exception:
+                pass
+            raise
+        self._pub = pub
         self._running = True
 
     def publish(self, topic, data):
@@ -123,28 +144,38 @@ class ZmqQuotePushChannel(QuotePushChannel):
 
     # -- client side ---------------------------------------------------------
     def start_subscriber(self, topics, on_msg):
+        """配置主题并启动订阅线程；启动完成后由该线程独占和关闭套接字。"""
         zmq, ctx = self._ensure_context()
         if not self.connect_address:
             raise ValueError("connect_address is required to start a subscriber")
         sub = ctx.socket(zmq.SUB)
-        sub.connect(self.connect_address)
-        for topic in topics or []:
-            sub.setsockopt(zmq.SUBSCRIBE, str(topic).encode("utf-8"))
-        self._sub = sub
-        self._running = True
-        self._sub_thread = threading.Thread(
-            target=self._sub_loop, args=(sub, on_msg), name="bigqmt-quote-push-sub", daemon=True
-        )
-        self._sub_thread.start()
+        try:
+            sub.connect(self.connect_address)
+            for topic in topics or []:
+                sub.setsockopt(zmq.SUBSCRIBE, str(topic).encode("utf-8"))
+            self._sub = sub
+            self._running = True
+            self._sub_thread = threading.Thread(
+                target=self._sub_loop, args=(sub, on_msg), name="bigqmt-quote-push-sub", daemon=True
+            )
+            self._sub_thread.start()
+        except Exception:
+            # 线程尚未启动，套接字仍归启动方所有，必须在此回收。
+            self._running = False
+            self._sub_thread = None
+            self._sub = None
+            try:
+                sub.close(linger=0)
+            except Exception:
+                pass
+            raise
 
     def _sub_loop(self, sub, on_msg):
-        # The SUB socket is owned by THIS thread; it must be closed HERE (in a
-        # finally) and never from another thread. Closing a ZMQ socket cross-
-        # thread trips a Windows signaler assertion and aborts the whole QMT
-        # process (the "auto-exit" users hit).
-        poller = self._zmq.Poller()
-        poller.register(sub, self._zmq.POLLIN)
+        """逐帧解码并回调；单帧损坏不影响后续消息，套接字始终在本线程关闭。"""
+        # 跨线程关闭 ZMQ 套接字可能触发 Windows signaler 断言并退出进程。
         try:
+            poller = self._zmq.Poller()
+            poller.register(sub, self._zmq.POLLIN)
             while self._running:
                 try:
                     events = dict(poller.poll(200))
@@ -159,25 +190,33 @@ class ZmqQuotePushChannel(QuotePushChannel):
                 if len(frames) < 2:
                     continue
                 topic = frames[0].decode("utf-8", errors="ignore")
-                data = decode_push_payload(frames[-1])
+                try:
+                    data = decode_push_payload(frames[-1])
+                except Exception as exc:
+                    print("%s invalid push payload: %s" % (self.print_prefix, exc))
+                    continue
                 payload_data = data.get("data") if isinstance(data, dict) else data
                 try:
                     on_msg(topic, payload_data)
                 except Exception as exc:
                     print("%s subscriber callback failed: %s" % (self.print_prefix, exc))
+        except Exception as exc:
+            print("%s zmq subscriber failed: %s" % (self.print_prefix, exc))
         finally:
+            self._running = False
             try:
                 sub.close(linger=0)
             except Exception:
                 pass
+            if self._sub is sub:
+                self._sub = None
 
     def stop(self):
-        # Signal the sub thread to exit and let IT close its own socket (see
-        # _sub_loop). Closing the SUB socket from this (foreign) thread would
-        # trip the Windows ZMQ signaler abort and crash QMT.
+        """请求停止并释放发布资源，订阅套接字由消费线程自行关闭。"""
+        # 回调可主动退订；当前线程不得等待自己结束。
         self._running = False
         thread = self._sub_thread
-        if thread is not None and thread.is_alive():
+        if thread is not None and thread is not threading.current_thread() and thread.is_alive():
             thread.join(1.0)
         self._sub_thread = None
         self._sub = None
@@ -220,24 +259,28 @@ class RedisQuotePushChannel(QuotePushChannel):
 
     # -- client side ---------------------------------------------------------
     def start_subscriber(self, topics, on_msg):
-        self._running = True
+        """启动拥有 Redis 订阅连接的线程，线程创建失败时恢复停止状态。"""
         self._thread = threading.Thread(
             target=self._sub_loop, args=(list(topics or []), on_msg), name="bigqmt-quote-push-sub", daemon=True
         )
-        self._thread.start()
+        self._running = True
+        try:
+            self._thread.start()
+        except Exception:
+            self._running = False
+            self._thread = None
+            raise
 
     def _sub_loop(self, topics, on_msg):
-        # The pubsub connection is owned by THIS thread and closed HERE so a
-        # concurrent stop() can't close it out from under us.
-        pubsub = self.redis.pubsub(ignore_subscribe_messages=True)
-        self._pubsub = pubsub
-        channels = [self._channel(topic) for topic in topics]
+        """在本线程创建和释放订阅连接，隔离畸形消息并继续消费。"""
+        # 创建连接、主题转换和 subscribe 都可能失败，统一纳入资源清理范围。
+        pubsub = None
         try:
-            pubsub.subscribe(*channels)
-        except Exception as exc:
-            print("%s redis subscribe failed: %s" % (self.print_prefix, exc))
-            return
-        try:
+            pubsub = self.redis.pubsub(ignore_subscribe_messages=True)
+            self._pubsub = pubsub
+            # 订阅是精确频道匹配，预先保留原始主题，避免冒号或自定义模板后缀被截断。
+            topics_by_channel = {self._channel(topic): str(topic) for topic in topics}
+            pubsub.subscribe(*topics_by_channel)
             while self._running:
                 try:
                     message = pubsub.get_message(timeout=0.2)
@@ -248,23 +291,36 @@ class RedisQuotePushChannel(QuotePushChannel):
                 channel = message.get("channel")
                 if isinstance(channel, bytes):
                     channel = channel.decode("utf-8", errors="ignore")
-                topic = str(channel).rsplit(":", 1)[-1]
-                data = decode_push_payload(message.get("data"))
+                topic = topics_by_channel.get(str(channel))
+                if topic is None:
+                    continue
+                try:
+                    data = decode_push_payload(message.get("data"))
+                except Exception as exc:
+                    print("%s invalid push payload: %s" % (self.print_prefix, exc))
+                    continue
                 payload_data = data.get("data") if isinstance(data, dict) else data
                 try:
                     on_msg(topic, payload_data)
                 except Exception as exc:
                     print("%s subscriber callback failed: %s" % (self.print_prefix, exc))
+        except Exception as exc:
+            print("%s redis subscribe failed: %s" % (self.print_prefix, exc))
         finally:
+            self._running = False
             try:
-                pubsub.close()
+                if pubsub is not None:
+                    pubsub.close()
             except Exception:
                 pass
+            if self._pubsub is pubsub:
+                self._pubsub = None
 
     def stop(self):
+        """通知消费线程退出；允许消息回调在本线程内停止订阅。"""
         self._running = False
         thread = self._thread
-        if thread is not None and thread.is_alive():
+        if thread is not None and thread is not threading.current_thread() and thread.is_alive():
             thread.join(1.0)
         self._thread = None
         self._pubsub = None

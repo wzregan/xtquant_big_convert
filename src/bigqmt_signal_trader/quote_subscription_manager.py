@@ -22,6 +22,7 @@ publish never stalls quote-thread state, and no callback can deadlock.
 import threading
 
 from .code_utils import normalize_stock_code
+from .quote_utils import is_option_code, latest_quote_batch
 
 
 def normalize_subscription_code(code):
@@ -49,7 +50,6 @@ def normalize_subscription_code(code):
         return normalize_stock_code(text)
     except Exception:
         return text.upper()
-from .quote_utils import is_option_code, latest_quote_batch
 
 
 def combo_key(code_list):
@@ -299,47 +299,55 @@ def _monotonic():
     return time.monotonic()
 
 
+
+
+
+
 def build_quote_subscription_service(
-    context_info,
-    transport_name="redis",
-    account_id="",
-    redis_client=None,
-    zmq_bind_address=None,
-    enabled=True,
-    heartbeat_timeout_seconds=30.0,
-    time_func=None,
+    context_info, transport_name="redis", account_id="", redis_client=None,
+    zmq_bind_address=None, enabled=True, heartbeat_timeout_seconds=30.0,
+    time_func=None, rpc_config=None, backend=None,
 ):
-    """Assemble the server-side whole-quote service: a ContextInfo-backed source,
-    a push channel matching the RPC transport, and a QuoteSubscriptionManager
-    wired so big-QMT pushes publish to the channel. Returns ``(manager, channel)``
-    or ``None`` when disabled. The caller starts the channel publisher and feeds
-    ``manager.reap_expired`` from the scheduler loop."""
+    """组装行情源和后端推送通道，调用方负责启动发布端和清理过期订阅。
+
+    rpc_config 为后端参数；zmq_bind_address 兼容已有推送地址覆盖项。
+    heartbeat_timeout_seconds 为客户端心跳过期秒数。
+    backend 为服务启动时固定的后端定义，省略时按名称选择。
+    """
     if not enabled:
         return None
-    from .quote_push_channel import RedisQuotePushChannel, ZmqQuotePushChannel
+    from .transports.backend import get_backend
 
     source = ContextInfoQuoteSource(context_info)
-    transport_name = str(transport_name or "redis").lower()
-    if transport_name == "zmq":
-        bind_address = zmq_bind_address or _default_quote_push_zmq_bind(account_id)
-        channel = ZmqQuotePushChannel(bind_address=bind_address)
-        push_endpoint = bind_address
-    else:
-        channel = RedisQuotePushChannel(redis_client, account_id=account_id)
-        push_endpoint = ""
-    manager = QuoteSubscriptionManager(
-        source,
-        heartbeat_timeout_seconds=heartbeat_timeout_seconds,
-        time_func=time_func,
-        on_push_publisher=channel.publish,
-        push_endpoint=push_endpoint,
+    config = dict(rpc_config or {})
+    if redis_client is not None:
+        config["redis_client"] = redis_client
+    if zmq_bind_address:
+        settings = dict(config.get("zmq") or {})
+        settings["quote_push_bind_address"] = zmq_bind_address
+        config["zmq"] = settings
+    selected_backend = backend if backend is not None else get_backend(transport_name)
+    channel = selected_backend.build_push_channel(
+        "server", config, account_id=account_id,
     )
+    try:
+        manager = QuoteSubscriptionManager(
+            source, heartbeat_timeout_seconds=heartbeat_timeout_seconds,
+            time_func=time_func, on_push_publisher=channel.publish,
+            push_endpoint=channel.publisher_endpoint,
+        )
+    except Exception:
+        # 通道工厂可能已分配原生资源，后续组装失败也要归还所有权。
+        try:
+            channel.stop()
+        except Exception:
+            pass
+        raise
     return manager, channel
 
 
 def _default_quote_push_zmq_bind(account_id):
-    """Default server PUB bind address: loopback, RPC zmq port + 1 (client side
-    derives the same host/port + 1 to connect)."""
-    from .transports.zmq_transport import _default_zmq_port
+    """保留原有辅助入口，地址规则统一由后端负责。"""
+    from .transports.backend import zmq_push_address
 
-    return "tcp://0.0.0.0:%d" % (_default_zmq_port(account_id) + 1)
+    return zmq_push_address("server", account_id=account_id)
