@@ -20,14 +20,13 @@ def _norm_topic(code_list):
 
 class WholeQuoteClientSession(object):
     def __init__(self, rpc_call, push_channel, client_id, heartbeat_interval_seconds=3.0, sub_id_func=None,
-                 push_silence_replay_heartbeats=10):
-        """``rpc_call`` is ``client.call``-shaped: fn(method, params) -> dict.
-        ``push_channel`` is a QuotePushChannel used purely as a subscriber.
-        ``sub_id_func`` (optional) mints subscription ids; defaults to a counter.
-        ``push_silence_replay_heartbeats``: after this many heartbeat rounds
-        without any push, replay subscriptions (covers server restarts where
-        keepalive keeps succeeding because the redis request queue buffers
-        during the restart window but the subscription table was reset)."""
+                 push_silence_replay_heartbeats=10, push_channel_factory=None):
+        """保存订阅会话；rpc_call 接受方法及参数，推送通道由本会话启动和停止。
+
+        heartbeat_interval_seconds 为心跳秒数；sub_id_func 生成稳定的订阅编号。
+        push_silence_replay_heartbeats 为无推送后重放的心跳轮数。
+        push_channel_factory 仅供确认型通道损坏后重建，须保留原订阅者身份。
+        """
         self._rpc = rpc_call
         self._channel = push_channel
         self.client_id = str(client_id or "")
@@ -39,9 +38,17 @@ class WholeQuoteClientSession(object):
         self._subscriptions = {}  # sub_id -> {"topic": str, "callback": fn, "codes": [...]}
         self._started = False
         self._subscriber_active = False
+        self._push_channel_used = False
         self._subscribed_topics = frozenset()  # topic set the subscriber covers now
         self._heartbeat_thread = None
         self._last_push_time = None  # monotonic time of last incoming push
+        self._acknowledged_push = getattr(push_channel, "supports_acknowledgements", False) is True
+        self._push_channel_factory = push_channel_factory
+        self._push_health_error = ""
+        self._push_callback_failed = False
+        self._push_reconciliation_required = False
+        self._push_recoveries = 0
+        self._push_health_busy = False
 
     # -- subscription lifecycle ---------------------------------------------
     def subscribe_whole_quote(self, code_list, callback=None):
@@ -125,6 +132,9 @@ class WholeQuoteClientSession(object):
                     return
                 sub_ids = list(self._subscriptions.keys())
                 last_push = self._last_push_time
+            if self._acknowledged_push and not self._check_push_health():
+                time.sleep(self._heartbeat_interval)
+                continue
             if not sub_ids:
                 time.sleep(self._heartbeat_interval)
                 continue
@@ -175,13 +185,74 @@ class WholeQuoteClientSession(object):
             try:
                 callback(data)
             except Exception:
+                if self._acknowledged_push:
+                    # 回调可能已有副作用；失败留给通道保留游标，不自行无限重放。
+                    raise
                 pass
 
+    def push_health(self):
+        """返回消费端状态；通道重建不等同于丢失区间已经完成对账。"""
+        with self._lock:
+            return {
+                "healthy": not self._push_health_error and not self._push_reconciliation_required,
+                "last_error": self._push_health_error, "callback_failed": self._push_callback_failed,
+                "reconciliation_required": self._push_reconciliation_required,
+                "recoveries": self._push_recoveries,
+                "health_check_busy": self._push_health_busy,
+            }
+
+    def _check_push_health(self):
+        """确认型订阅检查真实接收线程；传输故障重建，回调故障保留而不自动重复。"""
+        with self._lock:
+            if not self._subscriber_active:
+                return True
+            if self._push_callback_failed:
+                return False
+            channel = self._channel
+        try:
+            channel.check_health()
+            with self._lock:
+                if self._push_health_busy:
+                    self._push_health_busy = False
+                    self._push_health_error = ""
+            return True
+        except Exception as exc:
+            with self._lock:
+                self._push_health_error = "%s: %s" % (type(exc).__name__, exc)
+                if getattr(exc, "retryable", False):
+                    # 发布与确认争抢锁时只暂缓心跳，不销毁完整的未确认游标。
+                    self._push_health_busy = True
+                    return False
+                self._push_health_busy = False
+                self._push_callback_failed = bool(getattr(exc, "callback_failed", False))
+                self._push_reconciliation_required = True
+                if self._push_callback_failed:
+                    return False
+            if self._push_channel_factory is None:
+                return False
+            try:
+                channel.stop()
+                with self._lock:
+                    self._channel = self._push_channel_factory()
+                    self._subscriber_active = False
+                    self._push_channel_used = False
+                    self._subscribed_topics = frozenset()
+                    self._sync_subscriber_locked()
+                self.replay_subscriptions()
+                with self._lock:
+                    self._push_recoveries += 1
+                    self._push_health_error = ""
+                return True
+            except Exception as recovery_error:
+                with self._lock:
+                    self._push_health_error = "%s: %s" % (type(recovery_error).__name__, recovery_error)
+                return False
+
     def _sync_subscriber_locked(self):
-        """(Re)start the push-channel subscriber to cover exactly the active
-        topics. Reuses an existing subscriber when the topic set is unchanged;
-        stops it before restarting when the set changed. No-op when nothing is
-        subscribed (and stops the running subscriber in that case)."""
+        """同步组合主题；确认型通道原地更改过滤器，保留未确认共享游标。
+
+        调用方持有会话锁；全部退订正常停止，同实例显式新订阅才允许更改保留指纹。
+        """
         topics = sorted({entry["topic"] for entry in self._subscriptions.values()})
         active = frozenset(topics)
         if active == self._subscribed_topics:
@@ -195,6 +266,15 @@ class WholeQuoteClientSession(object):
                 self._subscriber_active = False
             self._subscribed_topics = active
             return
+        update_topics = getattr(self._channel, "update_topics", None)
+        if self._acknowledged_push and callable(update_topics):
+            if self._subscriber_active:
+                update_topics(topics)
+                self._subscribed_topics = active
+                return
+            if self._push_channel_used:
+                # 同实例正常退订后用户主动订阅新组合，与故障恢复的新实例明确分开。
+                update_topics(topics)
         if self._subscriber_active:
             try:
                 self._channel.stop()
@@ -202,6 +282,7 @@ class WholeQuoteClientSession(object):
                 pass
         self._channel.start_subscriber(topics, self._on_push)
         self._subscriber_active = True
+        self._push_channel_used = True
         self._subscribed_topics = active
 
     def _next_sub_id(self):

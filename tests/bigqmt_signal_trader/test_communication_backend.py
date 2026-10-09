@@ -253,7 +253,7 @@ def test_backend_capabilities_control_qmt_scheduler(memory_backend):
     """新后端按能力进入策略回调轮询，无需新增名称分支。"""
     assert _resolve_background_threads("memory_test", False) is False
     assert _resolve_background_threads("memory_test", None) is True
-    assert _resolve_background_threads("shm", False) is True
+    assert _resolve_background_threads("shm", False) is False
 
 
 def test_request_only_backend_rejects_push_without_fallback():

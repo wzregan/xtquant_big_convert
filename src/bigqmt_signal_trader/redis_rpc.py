@@ -2493,6 +2493,9 @@ class RedisPubSubRpcService:
                 print_prefix=print_prefix,
             )
         self._transport = transport
+        if getattr(transport, "supports_execution_gate", False):
+            # 收到请求与开始业务执行是两个时刻；本地排队期间也必须遵守原截止时间。
+            transport.defer_execution = True
         # Let the handlers reach the transport for read-only diagnostics
         # (reply-queue residency, #104). Set here rather than in the
         # strategy file so a reload picks it up without a restart.
@@ -2621,6 +2624,14 @@ class RedisPubSubRpcService:
         try:
             self.pending.put_nowait(payload)
         except queue.Full:
+            if getattr(self._transport, "supports_execution_gate", False):
+                # 有确认的传输不能静默丢弃已接收的旧请求，明确拒绝本次入队且不执行业务。
+                self._transport.send_response(payload, {
+                    "request_id": payload.get("request_id"), "ok": False, "data": None,
+                    "error": "RPC pending queue is full; request was not executed",
+                    "error_code": "SHM_QUEUE_FULL", "outcome_unknown": False,
+                })
+                return
             # A full pending queue (client polling storm) must not raise into the
             # adjust thread — QMT stops the strategy on a callback raise. Drop the
             # oldest request and keep the newest instead of crashing.
@@ -2752,7 +2763,19 @@ class RedisPubSubRpcService:
         return processed
 
     def process_request(self, request):
+        """在策略指定线程执行业务；支持执行门禁的传输需先确认请求仍有效。"""
         request = dict(request or {})
+        scope = getattr(self._transport, "execution_scope", None)
+        if callable(scope):
+            with scope(request) as accepted:
+                return self._process_request(request) if accepted else None
+        if getattr(self._transport, "supports_execution_gate", False):
+            if not self._transport.begin_request(request):
+                return None
+        return self._process_request(request)
+
+    def _process_request(self, request):
+        """执行已通过门禁的请求；延迟结算只保存结果，不重新提交业务操作。"""
         request_id = str(request.get("request_id") or request.get("id") or uuid.uuid4().hex)
         account_id = str(request.get("account_id") or self.account_id or "")
         method = str(request.get("method") or "")
@@ -2776,10 +2799,14 @@ class RedisPubSubRpcService:
             # return without guessing (#104).
             "_t_recv": time.time(),
         }
+        handler_attempted = False
         try:
             if self.account_id and account_id and account_id != self.account_id:
                 raise PermissionError("account_id mismatch")
             _t0 = time.perf_counter() if method == "ping" else 0.0
+            # 处理器异常可能出现在部分下单后，结果转换异常更是在业务返回之后。
+            # 仅传输具备执行门禁时声明这一保守边界，旧后端维持原错误响应语义。
+            handler_attempted = True
             result = self.handlers.handle(method, request.get("params") or {})
             _t1 = time.perf_counter() if method == "ping" else 0.0
             response["data"] = to_jsonable(result, request.get("dataframe_format", "records"))
@@ -2788,6 +2815,9 @@ class RedisPubSubRpcService:
             server_error = getattr(self.handlers, "_last_server_error", None)
             if server_error:
                 response["server_error"] = str(server_error)
+                if handler_attempted and getattr(self._transport, "supports_execution_gate", False):
+                    # 诊断可能来自已经提交的原生委托，ok=True 也不能证明可安全重报。
+                    response["outcome_unknown"] = True
             # passorder may still be awaiting its asynchronously assigned id;
             # a falsey native cancel may still be awaiting a reliable terminal
             # status (#148). Park either reply instead of sleeping on this
@@ -2803,6 +2833,11 @@ class RedisPubSubRpcService:
         except Exception as exc:
             response["error"] = "%s: %s" % (exc.__class__.__name__, exc)
             response["error_code"] = getattr(exc, "error_code", "")
+            if getattr(self._transport, "supports_execution_gate", False):
+                from .sdk_contract import ExecutionRejected
+                response["ok"] = False
+                # 专用异常仅用于进入原生交易前的明确拒绝；其他业务错误仍保留未知语义。
+                response["outcome_unknown"] = handler_attempted and not isinstance(exc, ExecutionRejected)
         response["_t_reply"] = time.time()
         _t_pub0 = time.perf_counter() if method == "ping" else 0.0
         try:

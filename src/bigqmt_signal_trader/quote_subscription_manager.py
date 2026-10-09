@@ -19,10 +19,17 @@ source and to the push publisher happen OUTSIDE the lock so a slow/blocking
 publish never stalls quote-thread state, and no callback can deadlock.
 """
 
+import copy
+import sys
 import threading
+import time
+import uuid
+from collections import deque
 
 from .code_utils import normalize_stock_code
+from .quote_push_channel import QuotePushChannel
 from .quote_utils import is_option_code, latest_quote_batch
+from .transports.base import TransportError
 
 
 def normalize_subscription_code(code):
@@ -299,8 +306,199 @@ def _monotonic():
     return time.monotonic()
 
 
+def _retained_payload_bytes(value, seen=None):
+    """保守统计快照保留的内置容器内存，seen 用于避免重复对象和循环引用。"""
+    if seen is None:
+        seen = set()
+    identity = id(value)
+    if identity in seen:
+        return 0
+    seen.add(identity)
+    size = sys.getsizeof(value)
+    if isinstance(value, dict):
+        size += sum(_retained_payload_bytes(key, seen) + _retained_payload_bytes(item, seen)
+                    for key, item in value.items())
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        size += sum(_retained_payload_bytes(item, seen) for item in value)
+    return size
 
 
+class BufferedAcknowledgedPublisher(QuotePushChannel):
+    """将原生回调与确认型推送隔开，以独立有界队列保留尚未提交的消息。
+
+    入队成功只表示本进程接收；共享日志提交成功才从队首移除，不代表订阅者已确认。
+    本地队列不承诺在进程崩溃后保留，粘滞故障需要显式对账或重启处理。
+    """
+
+    supports_acknowledgements = True
+
+    def __init__(self, channel, config=None):
+        """包装服务端通道；config 控制每类队列条数、内存及积压门槛。"""
+        settings = dict(config or {})
+        self._channel = channel
+        self._lock = threading.RLock()
+        self._queues = {"exec": deque(), "quote": deque()}
+        self._bytes = {"exec": 0, "quote": 0}
+        self._capacities = {
+            "exec": int(settings.get("local_exec_queue_items", 512)),
+            "quote": int(settings.get("local_quote_queue_items", 256)),
+        }
+        self._byte_limits = {
+            "exec": int(settings.get("local_exec_queue_bytes", 8 * 1024 * 1024)),
+            "quote": int(settings.get("local_quote_queue_bytes", 64 * 1024 * 1024)),
+        }
+        self._high_water = float(settings.get("local_queue_high_water", 0.75))
+        if min(list(self._capacities.values()) + list(self._byte_limits.values())) <= 0:
+            raise ValueError("local acknowledged push queue limits must be positive")
+        if not 0 < self._high_water <= 1:
+            raise ValueError("local_queue_high_water must be in (0, 1]")
+        self._closed = False
+        self._sticky_error = ""
+        self._last_error = ""
+        self._backpressure = False
+        self._health_busy = False
+        self._publishing_failed = False
+        self._local_queued = 0
+        self._shared_committed = 0
+        self._overflow_count = 0
+        self._pending_at_stop = 0
+
+    @property
+    def publisher_endpoint(self):
+        """沿用实际共享日志端点用于诊断。"""
+        return self._channel.publisher_endpoint
+
+    def start_publisher(self):
+        """启动实际发布端；构造失败仍由上层成套启动流程回收。"""
+        self._channel.start_publisher()
+
+    def start_subscriber(self, topics, on_msg):
+        """服务端包装器不承担订阅角色。"""
+        raise RuntimeError("buffered publisher cannot start a subscriber")
+
+    def publish(self, topic, data):
+        """保存事件快照并立即返回；满或关闭时显式失败且不覆盖旧消息。"""
+        lane = "exec" if str(topic).startswith("exec:") else "quote"
+        try:
+            # 配置复制会保留注入对象身份，事件快照必须连可变叶子也独立持有。
+            snapshot = copy.deepcopy(data)
+            retained_bytes = _retained_payload_bytes(snapshot)
+        except Exception as exc:
+            with self._lock:
+                self._sticky_error = "push snapshot failed: %s: %s" % (type(exc).__name__, exc)
+                self._last_error = self._sticky_error
+            raise TransportError(self._sticky_error)
+        entry = (uuid.uuid4().hex, str(topic), snapshot, retained_bytes)
+        with self._lock:
+            if self._closed:
+                self._sticky_error = "acknowledged publisher is closed"
+                raise TransportError(self._sticky_error)
+            if (len(self._queues[lane]) >= self._capacities[lane]
+                    or self._bytes[lane] + retained_bytes > self._byte_limits[lane]):
+                self._overflow_count += 1
+                self._sticky_error = "%s local acknowledged push queue is full" % lane
+                self._last_error = self._sticky_error
+                raise TransportError(self._sticky_error)
+            self._queues[lane].append(entry)
+            self._bytes[lane] += retained_bytes
+            self._local_queued += 1
+        return True
+
+    def flush(self, max_items=32, max_wall_seconds=0.01):
+        """策略线程按条数及秒数预算提交，交易优先，失败的队首保留同一消息编号。"""
+        deadline = time.monotonic() + max(0.0, float(max_wall_seconds))
+        committed = 0
+        with self._lock:
+            if self._closed or self._publishing_failed:
+                return 0
+        try:
+            self._channel.check_health()
+        except Exception as exc:
+            with self._lock:
+                self._last_error = "%s: %s" % (type(exc).__name__, exc)
+                if getattr(exc, "retryable", False):
+                    # 健康元数据锁繁忙不表示游标丢失，下一轮重查且保留现有队列。
+                    self._health_busy = True
+                else:
+                    self._sticky_error = self._last_error
+                    self._publishing_failed = True
+            return 0
+        with self._lock:
+            if self._health_busy:
+                self._health_busy = False
+                self._last_error = ""
+        while committed < max(0, int(max_items)) and time.monotonic() < deadline:
+            with self._lock:
+                if self._closed:
+                    return committed
+                lane = "exec" if self._queues["exec"] else "quote"
+                if not self._queues[lane]:
+                    self._backpressure = False
+                    return committed
+                entry = self._queues[lane][0]
+            try:
+                # 消费者确认回报也会短暂持有共享锁；立即尝试会把正常竞争误判成背压。
+                # 只使用本轮剩余时间等待，不能让每条消息重新获得完整的刷新预算。
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return committed
+                self._channel.publish(entry[1], entry[2], message_id=entry[0],
+                                      timeout_seconds=remaining)
+            except Exception as exc:
+                with self._lock:
+                    self._last_error = "%s: %s" % (type(exc).__name__, exc)
+                    self._backpressure = True
+                    if not getattr(exc, "retryable", False):
+                        self._sticky_error = self._last_error
+                        self._publishing_failed = True
+                return committed
+            with self._lock:
+                # stop 或并发回调不能让迟到的成功结果删除另一条消息。
+                if self._queues[lane] and self._queues[lane][0][0] == entry[0]:
+                    self._queues[lane].popleft()
+                    self._bytes[lane] -= entry[3]
+                    self._shared_committed += 1
+                    committed += 1
+                    self._backpressure = False
+                    self._last_error = ""
+        return committed
+
+    def status(self):
+        """返回本地接收、共享提交和故障状态，不把入队等同于对端确认。"""
+        with self._lock:
+            pending = {lane: len(items) for lane, items in self._queues.items()}
+            high_water = any(
+                pending[lane] >= max(1, self._capacities[lane] * self._high_water)
+                or self._bytes[lane] >= self._byte_limits[lane] * self._high_water
+                for lane in self._queues
+            )
+            blocked = bool(self._closed or self._sticky_error or self._backpressure
+                           or self._health_busy or high_water)
+            return {
+                "healthy": not blocked, "new_orders_blocked": blocked,
+                "local_pending": pending, "local_pending_bytes": dict(self._bytes),
+                "local_queued": self._local_queued, "shared_committed": self._shared_committed,
+                "sticky_error": self._sticky_error, "last_error": self._last_error,
+                "overflow_count": self._overflow_count, "pending_at_stop": self._pending_at_stop,
+                "health_check_busy": self._health_busy,
+            }
+
+    def check_health(self):
+        """查询实际通道健康；本地不可恢复故障继续明确报错。"""
+        state = self.status()
+        if state["sticky_error"]:
+            raise TransportError(state["sticky_error"])
+        return self._channel.check_health()
+
+    def stop(self):
+        """限时停止，保留待提交计数；停止不会自动清空或无限发送队列。"""
+        with self._lock:
+            self._closed = True
+            self._pending_at_stop = sum(len(items) for items in self._queues.values())
+            if self._pending_at_stop:
+                self._sticky_error = "publisher stopped with %d locally queued messages" % self._pending_at_stop
+                print("[bigqmt_quote_push] %s; reconciliation required" % self._sticky_error)
+        self._channel.stop()
 
 
 def build_quote_subscription_service(
@@ -331,6 +529,8 @@ def build_quote_subscription_service(
         "server", config, account_id=account_id,
     )
     try:
+        if getattr(selected_backend, "acknowledged_push", False):
+            channel = BufferedAcknowledgedPublisher(channel, config.get("shm"))
         manager = QuoteSubscriptionManager(
             source, heartbeat_timeout_seconds=heartbeat_timeout_seconds,
             time_func=time_func, on_push_publisher=channel.publish,

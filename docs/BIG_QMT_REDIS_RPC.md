@@ -353,8 +353,9 @@ print(response)
 ### 尾延迟 = 大 QMT 终端占 GIL(不是本代码)
 
 `gil_probe` 探针显示进程周期性被卡 ~490ms,但 `adjust_phase` 每段都 <50ms —— 即**尾延迟来自
-QMT 终端自身的 C++ 主循环占着 GIL**,`setswitchinterval`/精简 adjust 都 preempt 不了。唯一根治
-是把 serving 挪出该进程(sidecar 独立 GIL,见 `shm_transport.py` 预留)。
+QMT 终端自身的 C++ 主循环占着 GIL**,该历史探针中 `setswitchinterval`/精简 adjust 未消除停顿。
+现已实现 [共享内存后端](SHARED_MEMORY_BACKEND.md)，用于同机请求及推送通信；原生交易API仍由
+QMT策略线程执行，真实延迟仍受终端GIL和回调周期影响，需要在目标终端重新验收。
 
 ### schedule_adjust_interval 调这个数压尾延迟
 
@@ -407,4 +408,3 @@ python -B -m unittest discover -s tests\bigqmt_signal_trader
 Ran 68 tests
 OK
 ```
-

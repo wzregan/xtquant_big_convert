@@ -216,10 +216,20 @@ def _client_backend(client):
 
 
 def _build_client_push_channel(client, subscriber_role=None):
-    """按固定后端创建推送通道；subscriber_role 为后续分用途订阅保留的参数。"""
-    return _client_backend(client).build_push_channel(
-        "client", _client_communication_config(client), account_id=client.account_id,
-    )
+    """创建推送；确认型通道按用途保留稳定订阅身份，避免行情与交易争用游标。"""
+    backend = _client_backend(client)
+    config = _client_communication_config(client)
+    if getattr(backend, "acknowledged_push", False):
+        settings = dict(config.get("shm") or {})
+        identity = settings.get("subscriber_id") or settings.get("client_id")
+        if not identity:
+            identity = getattr(client, "_push_client_identity", None)
+            if not identity:
+                identity = uuid.uuid4().hex
+                client._push_client_identity = identity
+        settings["subscriber_id"] = "%s:%s" % (subscriber_role or "default", identity)
+        config["shm"] = settings
+    return backend.build_push_channel("client", config, account_id=client.account_id)
 
 
 def _missing_account_id_message():
@@ -2350,6 +2360,8 @@ class BigQmtXtData:
             client_id=_quote_client_id(),
             heartbeat_interval_seconds=_env_float("BIGQMT_QUOTE_HEARTBEAT_SECONDS", 3.0),
             sub_id_func=self._next_seq,
+            push_channel_factory=(self._build_quote_push_channel
+                                  if getattr(_client_backend(client), "acknowledged_push", False) else None),
         )
 
     def _build_quote_push_channel(self):
@@ -3002,6 +3014,14 @@ class BigQmtXtData:
         return BigQmtXtData.timetag_to_datetime(timetag, format)
 
 
+class _AcknowledgedExecutionEvent(dict):
+    """仅本地使用的回报完成信号，屏障放行后才能确认共享日志游标。"""
+
+    def __init__(self, payload):
+        """复制回报字典，完成信号及异常不进入业务消息字段。"""
+        super(_AcknowledgedExecutionEvent, self).__init__(payload)
+        self.completed = threading.Event()
+        self.callback_error = None
 
 
 class BigQmtXtTrader:
@@ -3026,6 +3046,8 @@ class BigQmtXtTrader:
         self.callback = None
         self._event_thread = None
         self._event_running = False
+        self._push_listener_error = ""
+        self._push_callback_failed = False
         # Async order submission (issue #50). One worker, started on first use,
         # so a client that never calls order_stock_async pays nothing.
         self._async_order_queue = _queue.Queue()
@@ -3036,6 +3058,9 @@ class BigQmtXtTrader:
         # order id -- never holds up the next submit (issue #181).
         self._async_callback_queue = _queue.Queue()
         self._async_callback_thread = None
+        # 回报可能早于任何异步下单；确认型错误回报同样需要完整的屏障生命周期。
+        self._async_barrier_lock = threading.RLock()
+        self._async_barrier = {}
         # int -> 合同编号 for ids handed out as OrderId (issue #113).
         self._order_sys_ids = _OrderedDict()
         # on_account_status used to report a hardcoded "STOCK" even for a
@@ -3235,7 +3260,7 @@ class BigQmtXtTrader:
         return _build_client_push_channel(self.client, subscriber_role="exec")
 
     def _event_loop_push_channel(self):
-        """监听一轮 ZMQ 执行事件；账户切换或通道失败后重新选择传输。"""
+        """监听一轮推送执行事件；临时锁忙保留通道，回调失败交给显式处理。"""
         from .exec_events import EXEC_TOPICS
 
         topics = sorted(set(EXEC_TOPICS.values()))
@@ -3247,10 +3272,33 @@ class BigQmtXtTrader:
             while self._event_running:
                 if str(self.client.account_id or "") != account_id:
                     return       # account changed -> rebuild against the new address
+                if getattr(channel, "supports_acknowledgements", False) is True:
+                    try:
+                        channel.check_health()
+                    except Exception as health_error:
+                        if not getattr(health_error, "retryable", False):
+                            raise
+                        # 共享元数据锁短暂繁忙不等于断连，不重建或重复回调。
+                        time.sleep(0.5)
+                        continue
                 time.sleep(0.5)
-        except Exception:
-            log.exception("执行事件推送通道异常，将在一秒后重试")
-            time.sleep(1.0)
+        except Exception as exc:
+            if channel is not None and getattr(channel, "supports_acknowledgements", False) is True:
+                self._push_listener_error = "%s: %s" % (type(exc).__name__, exc)
+                self._push_callback_failed = bool(getattr(exc, "callback_failed", False))
+                if self._push_callback_failed:
+                    self._event_running = False
+                callback = self.callback
+                if callback is not None:
+                    try:
+                        callback.on_disconnected()
+                    except Exception:
+                        log.exception("用户断连回调失败")
+            if self._push_callback_failed:
+                log.exception("执行事件回调失败，已停止自动重放，需显式核对后重启订阅")
+            else:
+                log.exception("执行事件推送通道异常，将在一秒后重试")
+                time.sleep(1.0)
         finally:
             if channel is not None:
                 try:
@@ -3259,8 +3307,10 @@ class BigQmtXtTrader:
                     pass
 
     def _on_push_exec_event(self, topic, data):
-        """Push-channel callback. The payload is already a decoded dict, unlike
-        the Redis path which hands over raw bytes."""
+        """确认型推送等待用户回调完成，其他通道沿用原有分发与异常处理。"""
+        if getattr(_client_backend(self.client), "acknowledged_push", False):
+            self._dispatch_event(data, acknowledged=True)
+            return
         try:
             self._dispatch_event(data)
         except Exception:
@@ -3355,8 +3405,8 @@ class BigQmtXtTrader:
             except Exception:
                 pass
 
-    def _dispatch_event(self, raw):
-        """接收 Redis 字节串或推送字典，按客户端账号过滤后分发；缺账号兼容旧协议。"""
+    def _dispatch_event(self, raw, acknowledged=False):
+        """按账号分发；acknowledged 为真时等待实际回调完成，失败不能确认游标。"""
         callback = self.callback
         if callback is None:
             return
@@ -3375,17 +3425,35 @@ class BigQmtXtTrader:
         # ZMQ 执行主题由多个账号共用，过滤必须早于屏障、编号映射和用户回调。
         if event_account and client_account and event_account != client_account:
             return
+        if acknowledged:
+            event = _AcknowledgedExecutionEvent(event)
         # 放行超时的屏障, 再决定这条事件是直通还是暂存 (issue #51)。
+        held = False
         try:
             self._sweep_order_barriers()
             if event.get("event_type") in ("order", "trade", "order_error", "cancel_error") and self._hold_if_pending(event):
-                return
+                held = True
         except Exception:
             pass  # 屏障故障绝不能吞掉事件
-        self._deliver_event(event)
+        if not held:
+            self._deliver_event(event)
+        if acknowledged:
+            self._wait_acknowledged_execution(event)
 
+    def _wait_acknowledged_execution(self, event):
+        """有界等待异步报单屏障及用户回调，不把本地暂存误当共享日志消费完成。"""
+        from .transports.base import TransportError
+
+        deadline = time.monotonic() + max(1.0, float(self.ASYNC_BARRIER_TIMEOUT_SECONDS) + 1.0)
+        while not event.completed.wait(0.05):
+            self._sweep_order_barriers()
+            if not self._event_running or time.monotonic() >= deadline:
+                raise TransportError("execution callback is not completed; reconciliation required")
+        if event.callback_error is not None:
+            raise event.callback_error
 
     def _deliver_event(self, event):
+        """执行用户回调；确认型事件将完成或失败传回等待中的推送线程。"""
         callback = self.callback
         if callback is None:
             return
@@ -3430,13 +3498,18 @@ class BigQmtXtTrader:
                         ),
                     )
                 )
-        except Exception:
+        except Exception as exc:
             # 业务回调异常不能打崩事件线程，但必须留痕（issue: 静默吞错）。
             log.exception(
                 "user callback failed: event_type=%s account=%s",
                 event.get("event_type"),
                 account_id,
             )
+            if isinstance(event, _AcknowledgedExecutionEvent):
+                event.callback_error = exc
+        finally:
+            if isinstance(event, _AcknowledgedExecutionEvent):
+                event.completed.set()
 
     def run_forever(self):
         while True:

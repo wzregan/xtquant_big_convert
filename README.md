@@ -6,7 +6,7 @@
 
 大 QMT 运行环境里的 RPC 桥接包：把大 QMT 内置 Python（行情查询、交易、持仓）封装成**可远程调用的服务**，并兼容一组 MiniQMT 方法名，让外部程序无需 XtQuantServer 权限就能驱动大 QMT。
 
-支持 **Redis / ZMQ / MySQL / 共享内存** 四种可插拔传输，切换只需改一个配置字段。
+已实现 **Redis / ZMQ / MySQL / 共享内存** RPC 传输，通信后端统一创建请求响应、行情及交易回报通道。共享内存提供同机 RPC、回调确认与有界推送日志；配置及可靠性边界见 [共享内存后端](docs/SHARED_MEMORY_BACKEND.md)，通用接口见 [通信后端说明](docs/COMMUNICATION_BACKENDS.md)。
 
 已发布 PyPI，客户端一行安装：`pip install xtquant-big-convert`（详见下文「环境要求与依赖安装」）。
 
@@ -534,7 +534,7 @@ xt_trader.reload_status()            # -> {'ok': True, 'modules_purged': 28,
 | **zmq** + drain | 95ms | 95ms | 10 / 10 次每秒 | ✅ | 无 redis 时的同机方案 |
 | **zmq** + 后台线程 | 405ms | 607ms | 2.4 / 1.7 次每秒 | ✅ | 旧默认，不推荐 |
 | **mysql** | ~105ms | — | — | ✅ | 兼容兜底 |
-| **shm** | — | — | — | ❌ | 接口预留（未实现）|
+| **shm** | 待Windows/QMT验收 | 待Windows/QMT验收 | 待Windows/QMT验收 | ❌ | 同机共享内存；有界背压、执行门禁、回调ACK |
 
 > **这张表在 0.3.21 之前是反的**，写着 zmq「同机低延迟 p50~0.7ms」、redis 13ms。
 > 那个 0.7ms 是撞上 adjust 空窗的最好情况，不是 p50；redis 的 13ms 一直是准的。
@@ -1266,7 +1266,8 @@ src/bigqmt_signal_trader/
 │   ├── redis_transport.py         Redis（默认，rpush/blpop/brpop）
 │   ├── zmq_transport.py           ZMQ（ROUTER/DEALER + 服务发现）
 │   ├── mysql_transport.py         MySQL（轮询 + DBUtils 连接池）
-│   ├── shm_transport.py           共享内存（stub）
+│   ├── shm_transport.py           共享内存 RPC（执行门禁、会话隔离）
+│   ├── shm_primitives.py          跨进程映射、互斥与唤醒
 │   └── factory.py                 build_transport 工厂
 ├── adapters/                      QMT API 适配器
 │   ├── market_bigqmt.py           行情（ContextInfo 封装）

@@ -1,12 +1,5 @@
 # coding: utf-8
-"""Tests for the pluggable transport layer.
-
-Covers:
-* ``FakeTransport`` round-trip (validates the abstract contract).
-* ZMQ transport round-trip on tcp loopback (the main low-latency path).
-* MySQL transport round-trip against an in-memory sqlite3 DB (driver-agnostic).
-* Factory dispatch: name → transport class, unknown-name rejection, shm raising.
-"""
+"""检验可插拔传输：进程内契约、ZMQ/MySQL往返、工厂分派及SHM惰性构造。"""
 
 import os
 import sys
@@ -173,10 +166,13 @@ class FactoryTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_transport("nonsense", {}, account_id="x")
 
-    def test_shm_raises_on_use(self):
+    def test_shm_factory_is_lazy_and_supports_polling(self):
+        """共享内存工厂已可用，构造不能偷偷打开连接或等待对端。"""
         shm = build_transport("shm", {}, account_id="x")
-        with self.assertRaises(TransportError):
-            shm.send_request(_build_request(), 1.0)
+        self.assertIsNone(shm._region)
+        self.assertTrue(shm.supports_execution_gate)
+        self.assertEqual(shm.drain_request_queue(), 0)
+        shm.stop()
 
     def test_redis_factory_with_injected_clients(self):
         sentinel_listen = object()

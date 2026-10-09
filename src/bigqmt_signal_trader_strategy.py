@@ -692,6 +692,10 @@ def _build_rpc_service(context_info, app, config):
             # 报单来源 blank), and a default would swallow it -- issue #154.
             default_strategy_name=rpc_config.get("default_strategy_name"),
         )
+        if getattr(backend, "acknowledged_push", False):
+            _install_acknowledged_push_gate(
+                handlers, _quote_subscription_service[1] if _quote_subscription_service is not None else None,
+            )
         # Neither of these may depend on the TRANSPORT. Only a redis transport
         # builds the two clients above, so on zmq both were None -- and each had a
         # working counterpart on the other side of that None:
@@ -823,9 +827,11 @@ def _drain_rpc_service(config):
     rpc_config = dict(config.get("rpc") or {})
     max_items = int(rpc_config.get("drain_max_items", 20))
     processed = 0
+    _flush_acknowledged_push(config)
     if hasattr(_rpc_service, "drain_request_queue"):
         processed += _rpc_service.drain_request_queue(max_items=max_items)
     processed += _rpc_service.drain_pending(max_items=max_items)
+    _flush_acknowledged_push(config)
     if _quote_subscription_service is not None:
         try:
             _quote_subscription_service[0].reap_expired()
@@ -834,8 +840,49 @@ def _drain_rpc_service(config):
     return processed
 
 
+def _install_acknowledged_push_gate(handlers, channel):
+    """仅确认型推送增加报单门禁及健康诊断，查询和撤单仍沿用原处理器。"""
+    from bigqmt_signal_trader.sdk_contract import ExecutionRejected
+
+    original_handle = handlers.handle
+
+    def health():
+        """禁用可靠推送时明确阻断新交易，不能把缺少通道当正常。"""
+        if channel is None:
+            return {"healthy": False, "new_orders_blocked": True,
+                    "sticky_error": "acknowledged push is disabled"}
+        return channel.status()
+
+    def guarded_handle(method, params=None):
+        """原权限及业务算法保持原样，仅在新报单之前检查通信状态。"""
+        canonical = handlers._canonical_method(str(method or "").strip())
+        if canonical in ("submit_order", "submit_orders_batch", "passorder"):
+            state = health()
+            if state.get("new_orders_blocked"):
+                # 门禁在原生报单前拒绝；明确声明未执行，避免账本将其误记为 UNKNOWN。
+                raise ExecutionRejected("acknowledged push is unhealthy; new orders blocked: %s"
+                                        % (state.get("sticky_error") or state.get("last_error") or "backlog"))
+        result = original_handle(method, params)
+        if canonical == "ping" and isinstance(result, dict):
+            result = dict(result)
+            result["communication_health"] = health()
+        return result
+
+    handlers.handle = guarded_handle
 
 
+def _flush_acknowledged_push(config):
+    """按小批次及墙钟预算发送，原生回调不等待共享日志腾出空间。"""
+    if _quote_subscription_service is None:
+        return 0
+    channel = _quote_subscription_service[1]
+    if getattr(channel, "supports_acknowledgements", False) is not True:
+        return 0
+    settings = dict((config.get("rpc") or {}).get("shm") or {})
+    return channel.flush(
+        max_items=int(settings.get("local_flush_items", 32)),
+        max_wall_seconds=float(settings.get("local_flush_wall_seconds", 0.01)),
+    )
 
 
 def _refresh_full_tick_cache(context_info, config):

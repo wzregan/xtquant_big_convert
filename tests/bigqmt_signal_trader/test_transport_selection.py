@@ -41,12 +41,10 @@ class BackgroundThreadResolutionTest(unittest.TestCase):
         self.assertFalse(_resolve_background_threads("mysql", False))
         self.assertTrue(_resolve_background_threads("mysql", True))
 
-    def test_drainless_transports_ignore_the_override(self):
-        # shm has no drain_request_queue: without the receiver thread requests
-        # would never be picked up, so even an explicit False cannot turn it
-        # off here.
-        self.assertTrue(_resolve_background_threads("shm", None))
-        self.assertTrue(_resolve_background_threads("shm", False))
+    def test_shm_defaults_to_qmt_scheduler_polling(self):
+        """共享内存已实现轮询，默认保留原生QMT主线程调度。"""
+        self.assertFalse(_resolve_background_threads("shm", None))
+        self.assertFalse(_resolve_background_threads("shm", False))
         self.assertTrue(_resolve_background_threads("shm", True))
 
     def test_is_redis_transport(self):

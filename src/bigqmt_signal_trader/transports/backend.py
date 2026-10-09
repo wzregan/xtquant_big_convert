@@ -10,7 +10,7 @@ class CommunicationBackend(object):
     def __init__(self, name, rpc_factory, push_factory=None,
                  supports_scheduler_polling=False, default_background_threads=True,
                  execution_events_via_push=False, redis_auxiliary_default=False,
-                 push_depends_on_redis=False):
+                 push_depends_on_redis=False, acknowledged_push=False):
         """定义后端；创建出的通道由调用方启动和关闭。
 
         rpc_factory 接收 config、account_id、print_prefix，返回 RpcTransport。
@@ -19,6 +19,7 @@ class CommunicationBackend(object):
         execution_events_via_push 表示可通过推送通道接收交易回报。
         redis_auxiliary_default 保留原有 Redis 日志和缓存的缺省启用行为。
         push_depends_on_redis 表示推送也依赖 Redis，故障时不能作为独立回退通道。
+        acknowledged_push 表示支持回调确认及有界日志保留，不代表掉电持久化。
         """
         self.name = str(name).strip().lower()
         if not self.name or self.name == "default":
@@ -29,6 +30,8 @@ class CommunicationBackend(object):
             raise TypeError("push_factory must be callable")
         if execution_events_via_push and push_factory is None:
             raise ValueError("event push requires a push_factory")
+        if acknowledged_push and push_factory is None:
+            raise ValueError("acknowledged push requires a push_factory")
         if not default_background_threads and not supports_scheduler_polling:
             raise ValueError("backend without scheduler polling requires background threads")
         self._rpc_factory = rpc_factory
@@ -38,6 +41,7 @@ class CommunicationBackend(object):
         self.execution_events_via_push = bool(execution_events_via_push)
         self.redis_auxiliary_default = bool(redis_auxiliary_default)
         self.push_depends_on_redis = bool(push_depends_on_redis)
+        self.acknowledged_push = bool(acknowledged_push)
 
     def build_rpc_transport(self, config=None, account_id="", print_prefix="[bigqmt_rpc]"):
         """创建 RPC 通道；config 为后端参数及依赖对象，调用方负责生命周期。"""
@@ -193,6 +197,14 @@ def _build_redis_push(role, config, account_id, print_prefix):
     return RedisQuotePushChannel(client, account_id=account_id, print_prefix=print_prefix)
 
 
+def _build_shm_push(role, config, account_id, print_prefix):
+    """创建同机共享日志通道，此时不分配命名映射或同步对象。"""
+    from ..shm_push_channel import SharedMemoryQuotePushChannel
+
+    return SharedMemoryQuotePushChannel(
+        role=role, config=dict(config.get("shm") or {}),
+        account_id=account_id, print_prefix=print_prefix,
+    )
 
 
 # 注册时不建立连接；同一后端成套提供 RPC、推送及策略线程调度能力。
@@ -210,4 +222,8 @@ register_backend(CommunicationBackend("mysql", _build_mysql, _build_redis_push,
                                      supports_scheduler_polling=True,
                                      redis_auxiliary_default=True,
                                      push_depends_on_redis=True))
-register_backend(CommunicationBackend("shm", _build_shm))
+register_backend(CommunicationBackend("shm", _build_shm, _build_shm_push,
+                                     supports_scheduler_polling=True,
+                                     default_background_threads=False,
+                                     execution_events_via_push=True,
+                                     acknowledged_push=True))

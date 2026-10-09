@@ -1,6 +1,6 @@
 # 可插拔 RPC 传输层
 
-更新时间：2026-07-29
+更新时间：2026-10-09；历史终端延迟样本保留，不能直接当作当前部署结果。
 
 ## 目标
 
@@ -11,7 +11,7 @@
 | **`redis`（默认）** | **~10ms** | ✅ | redis-py | 生产默认，也是实测最快的 |
 | `zmq` | ~95ms（drain）| ✅（tcp） | pyzmq | 没有 redis 时的同机方案 |
 | `mysql` | ~50ms+ | ✅ | DBUtils + 驱动 | 兼容兜底（Redis/ZMQ 都不可用时）|
-| `shm` | — | ❌ | — | 留接口未实现（需 Python 3.8+）|
+| `shm` | 待Windows/QMT验收 | ❌ | 标准库，显式选用msgpack时需该依赖 | 同机RPC与确认型推送，兼容Python3.6语法 |
 
 切换传输**只改一个配置字段 `transport`**，业务代码（handlers / `to_jsonable` / `process_request`）零改动。
 
@@ -69,7 +69,7 @@ BIGQMT_REDIS_CONFIG = {
 > **注意（ZMQ）**：ZMQ 支持由 QMT 官方 `adjust` 回调排空请求。低延迟实盘建议设置
 > `rpc_background_threads=False`，并把 `schedule_adjust_interval` 设置为
 > `100nMilliSecond`，避免后台 Python 线程受 QMT 进程 GIL 调度影响。
-> MySQL/SHM 仍会自动启用后台接收线程。
+> MySQL 可显式配置策略轮询；SHM 默认使用策略轮询，避免将原生交易API搬到后台线程。
 > 端口不写时按账号自动派生 `tcp://127.0.0.1:{15560 + 账号%100}`（同机回环）。
 > Linux 同机也可使用 `ipc:///tmp/bigqmt_rpc.sock`。
 
@@ -160,10 +160,13 @@ BIGQMT_REDIS_CONFIG = {
 
 注意：sqlite 连接线程绑定，sqlite 测试需 `check_same_thread=False` + `maxshared=0`。
 
-### SHM（`transport: shm`，未实现）
+### SHM（`transport: shm`）
 
-留接口，`send_request` 会抛 `TransportError`。Python 3.8+ 的
-`multiprocessing.shared_memory` 或自定义 mmap 环形缓冲区可后续实现。
+已实现命名映射、跨进程互斥与唤醒、请求执行门禁及大报文映射。
+行情和交易推送采用独立有界日志，在消费回调完成后确认；容量不足明确背压。
+Windows 实现使用 `mmap` 和 Win32 内核对象，运行路径不依赖
+`multiprocessing.shared_memory`。配置、恢复限制与目标平台验收方法见
+[共享内存后端](SHARED_MEMORY_BACKEND.md)。
 
 ## 实测延迟对比（同机）
 
@@ -194,7 +197,8 @@ src/bigqmt_signal_trader/transports/
 ├── redis_transport.py     # Redis 实现（默认，零行为变更）
 ├── zmq_transport.py       # ZMQ ROUTER/DEALER 实现
 ├── mysql_transport.py     # MySQL + DBUtils 连接池
-├── shm_transport.py       # 共享内存 stub
+├── shm_transport.py       # 共享内存RPC及执行门禁
+├── shm_primitives.py      # 命名映射、跨进程互斥及唤醒
 └── factory.py             # build_transport(name, config) 工厂
 ```
 
