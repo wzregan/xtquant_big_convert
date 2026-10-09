@@ -3045,8 +3045,9 @@ class BigQmtXtTrader:
         # ping reports, fall back to what the caller declared.
         self._server_account_type = ""
         self._declared_account_type = ""
-        # 查询和撤单使用独立队列，保留上游批量下单及回调调度器。
+        # 查询保留串行回调；撤单独立并发，避免每单确认等待累加且阻塞查单。
         self._request_worker = AsyncWorker("bigqmt-async-request")
+        self._cancel_worker = AsyncWorker("bigqmt-async-cancel", max_workers=20)
 
     def _cached_position_snapshot(self, account_id):
         key = "bigqmt:positions:%s" % str(account_id or self.client.account_id or "")
@@ -3160,7 +3161,8 @@ class BigQmtXtTrader:
         # Costs nothing when the queue is empty (issue #156).
         self._drain_async_orders_on_exit()
         deadline = time.monotonic() + 1.0
-        self._request_worker.close(timeout=1.0)
+        self._cancel_worker.close(timeout=max(0.0, deadline - time.monotonic()))
+        self._request_worker.close(timeout=max(0.0, deadline - time.monotonic()))
         self._event_running = False
         thread = self._event_thread
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
@@ -4447,7 +4449,9 @@ class BigQmtXtTrader:
 
     def wait_async_requests(self, timeout=10.0):
         """等待异步查询、撤单及其回调结束；timeout 单位为秒，超时返回 False。"""
-        return self._request_worker.wait(timeout)
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        return (self._request_worker.wait(max(0.0, deadline - time.monotonic()))
+                and self._cancel_worker.wait(max(0.0, deadline - time.monotonic())))
 
     def order_stock_batch(self, account, orders, batch_id="", idempotent=True,
                           timeout_seconds=None):
@@ -4845,17 +4849,17 @@ class BigQmtXtTrader:
                 log.exception("user callback failed: on_cancel_order_stock_async_response seq=%s", seq)
 
     def cancel_order_stock_async(self, account, order_id):
-        """异步撤单并立即返回请求序号，结果由 on_cancel_order_stock_async_response 接收。"""
+        """并发撤单并立即返回序号；响应按完成顺序到达，调用方按 seq 关联。"""
         seq = self._next_async_seq()
-        self._request_worker.submit(
+        self._cancel_worker.submit(
             self._run_async_cancel, seq, self.cancel_order_stock, account, order_id, (order_id,),
         )
         return seq
 
     def cancel_order_stock_sysid_async(self, account, market, order_sysid):
-        """按市场及系统委托号异步撤单并立即返回序号；回调在工作线程执行。"""
+        """按市场及系统委托号并发撤单，立即返回序号；完成回调可能不按提交顺序。"""
         seq = self._next_async_seq()
-        self._request_worker.submit(
+        self._cancel_worker.submit(
             self._run_async_cancel, seq, self.cancel_order_stock_sysid, account,
             order_sysid, (market, order_sysid),
         )
