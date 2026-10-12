@@ -6,8 +6,7 @@
 .\install_grpc_companion.ps1 `
   -InstanceDir C:\Users\root\code\qmt-grpc-bigqmt `
   -ConfigPath C:\ProgramData\qmt-grpc-bigqmt\config.yaml `
-  -QmtPythonDir 'C:\东北证券NET专业版(测试版)\python' `
-  -NativePython C:\Users\root\code\qmt-grpc\.venv\Scripts\python.exe
+  -QmtPythonDir 'C:\东北证券NET专业版(测试版)\python'
 ```
 
 在大 QMT 中启动 BIG_CONVERT 后，初始化和后续回调会异步触发 `qmt-grpc-bigqmt`。计划任务的 IgnoreNew 和伴随进程的文件锁共同避免重复启动。任务在 `WAITING_FOR_BRIDGE` 状态等待真实 RPC ping；桥接就绪才创建 gRPC 子进程。子进程异常退出按 2～60 秒退避重试，持续运行一分钟后重置退避。`CHILD_RUNNING` 仅表示子进程存在，业务是否可用仍看 GetSystemStatus。
@@ -22,13 +21,13 @@
 
 多个 SDK 客户端核对同一柜台委托时，必须共用相同的 `BIGQMT_ORDER_ID_DB`。该映射把柜台委托号转换为兼容 SDK 的整数订单号；各用一份数据库会造成跨进程编号不同，不能据此判定柜台丢单。详细部署要求见 [兼容说明](QMT_GRPC_COMPAT.md)。
 
-## ETF 分类来源
+## ETF 分类与可卖数量
 
-当前大 QMT 的五类 ETF 板块可为空。显式传入 `NativePython` 时，启动器使用同机已有的原生 MiniQMT 环境，只读导出分类到独立配置目录的 `etf-reference.json`。运行环境必须保留原生 xtquant，不能安装兼容 shim。该参数可省略；省略时只使用大 QMT 自身数据源。
+配套 qmt-grpc 的柜台可卖确认版本不再使用 ETF 分类决定买入后何时可卖。策略只需读取子账户的 `Position.available`；已成交但待柜台确认的份额暂记 `in_transit`，分类缺失不再阻断正常委托，价格、数量、资金与风控仍照常校验。
 
-导出每五分钟检查一次，失败三十秒后重试。文件具有来源、采集日期和 SHA256；五类都必须非空，T0/T1 不得冲突。只接受上海当日证据，跨日、损坏或未知 ETF 均阻止生成结算规则。它是**显式的原生 MiniQMT 参考数据依赖**，行情、账户和执行链路仍使用大 QMT。未覆盖的新 ETF 不按代码推测 T0/T1。
+伴随进程不再启动原生 MiniQMT 分类导出，不会周期刷新 `etf-reference.json`。安装脚本的 `NativePython` 和旧启动器的 `--reference-python`、`--reference-exporter` 参数保留兼容并忽略；旧分类文件环境变量不会传给服务子进程。更新 qmt-grpc 时需同时采用包含此行为的配套版本。
 
-`SettlementSource` 与 `SettlementAsOf` 保留证据来源并进入 qmt-grpc 规则版本。同一天分类不变时保持文件版本。证券类型查询独立于价格单位、可交易状态和结算周期；类型可用不代表能下单。
+转换 SDK 中独立使用的参考文件解析接口仍保留，但它不再是正常 gRPC 下单或可卖确认的依赖。显式周期可作为参考返回；策略不能据此越过自己的可卖余额。
 
 ## 数据语义
 

@@ -14,7 +14,7 @@ $localConfig = Join-Path $QmtPythonDir 'bigqmt_signal_trader_local_config.py'
 foreach ($required in @($instancePython, $ConfigPath, $localConfig)) {
     if (-not (Test-Path $required)) { throw "Missing required file: $required" }
 }
-if ($NativePython -and -not (Test-Path $NativePython)) { throw 'Native Python does not exist' }
+# NativePython 参数只保留旧调用兼容，部署和运行都不再依赖原生分类解释器。
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($task -and $task.State -eq 'Running') {
     throw 'Stop this independent task before replacing its launcher'
@@ -40,13 +40,8 @@ function Quote-Native([string]$Value) {
 }
 
 $arguments = '-u -m qmt_grpc.bootstrap.bigqmt_companion --config ' + (Quote-Native $ConfigPath)
-if ($NativePython) {
-    $exporter = Join-Path $InstanceDir 'export_etf_reference.py'
-    Copy-Item (Join-Path $PSScriptRoot 'export_etf_reference.py') $exporter -Force
-    $arguments += ' --reference-python ' + (Quote-Native $NativePython) + ' --reference-exporter ' + (Quote-Native $exporter)
-}
 $lines = @(
-    '# 由 BIG_CONVERT 触发；伴随进程负责就绪等待、分类刷新和异常重试。',
+    '# 由 BIG_CONVERT 触发；伴随进程负责就绪等待和异常重试。',
     '$ErrorActionPreference = ''Stop''',
     '$env:PYTHONIOENCODING = ''utf-8''',
     '$env:BIGQMT_AUTO_SYNC = ''0''',
