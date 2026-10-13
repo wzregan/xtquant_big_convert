@@ -17,6 +17,8 @@ The normalized field names match ``BigQmtXtTrader._order_from_dict`` /
 import json
 import time
 
+from . import diagnostics
+
 
 ORDER_CHANNEL_TEMPLATE = "bigqmt:order_events:{account_id}"
 TRADE_CHANNEL_TEMPLATE = "bigqmt:trade_events:{account_id}"
@@ -547,9 +549,9 @@ def enrich_order_identity(redis_client, account_id, event):
 
 
 def normalize_trade_event(trade, account_id=""):
-    """Build a JSON-able trade (成交) event dict from a Big QMT dealInfo object."""
+    """规范成交推送；DEBUG 保留两个易混淆佣金字段及最终选值。"""
     direction = _extract_direction(trade)
-    return {
+    event = {
         "event_type": EVENT_TRADE,
         "account_id": str(_attr(trade, ["m_strAccountID", "account_id"], account_id) or account_id or ""),
         "stock_code": _with_exchange_suffix(
@@ -592,6 +594,14 @@ def normalize_trade_event(trade, account_id=""):
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "created_at_ts": time.time(),
     }
+    if diagnostics.enabled():
+        diagnostics.trace("trade_callback_mapping", account_id=event["account_id"],
+                          gateway_order_id=event["order_sys_id"], trade_id=event["trade_id"],
+                          raw=diagnostics.native_fields(trade, (
+                              "m_dComssion", "m_dCommission", "commission", "m_dTradeAmount")),
+                          commission=event["commission"], quantity=event["volume"],
+                          amount=event["amount"])
+    return event
 
 
 # Push-channel topics, used when exec events travel over the quote push channel

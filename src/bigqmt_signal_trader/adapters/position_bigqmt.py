@@ -1,6 +1,7 @@
 """Big QMT position and asset adapters."""
 
 from ..account_type_map import account_type_for
+from .. import diagnostics
 from ..code_utils import normalize_stock_code
 from ..models import AssetSnapshot, PositionSnapshot, PositionStatisticsSnapshot
 
@@ -272,6 +273,7 @@ class BigQmtPositionProvider:
         return stats
 
     def get_asset(self, account_id):
+        """按账户读取柜台资金；DEBUG 仅记录候选金额字段，账户标识由诊断层脱敏。"""
         query = self._require_query_func()
         rows = []
         for detail_type in ("ACCOUNT", "ASSET"):
@@ -279,9 +281,14 @@ class BigQmtPositionProvider:
                 rows = query(account_id, self._resolve_account_type(account_id), detail_type) or []
                 if rows:
                     break
-            except Exception:
+            except Exception as exc:
+                if diagnostics.enabled():
+                    diagnostics.trace("asset_query_failed", detail_type=detail_type,
+                                      error_type=type(exc).__name__)
                 rows = []
         if not rows:
+            if diagnostics.enabled():
+                diagnostics.trace("asset_empty", account_id=account_id)
             return AssetSnapshot(account_id=account_id, cash=None, total_asset=None)
 
         row = rows[0]
@@ -289,18 +296,30 @@ class BigQmtPositionProvider:
         total_asset = _attr(row, ("m_dBalance", "m_dAsset", "total_asset", "asset"))
         frozen_cash = _attr(row, _FROZEN_CASH_FIELDS)
         market_value = _attr(row, _MARKET_VALUE_FIELDS)
+        market_value_derived = market_value is None
         if frozen_cash is None:
             _report_missing_field("frozen_cash", row, _FROZEN_CASH_FIELDS)
         if market_value is None and cash is not None and total_asset is not None:
-            # Derive only as a last resort. Without frozen_cash this overstates
-            # market value by the frozen amount, so subtract it when known.
+            # 仅原生市值缺失时回推；已知冻结资金也须扣除，避免把冻结款误当市值。
             market_value = float(total_asset) - float(cash)
             if frozen_cash is not None:
                 market_value -= float(frozen_cash)
-        return AssetSnapshot(
+        snapshot = AssetSnapshot(
             account_id=account_id,
             cash=float(cash) if cash is not None else None,
             total_asset=float(total_asset) if total_asset is not None else None,
             frozen_cash=float(frozen_cash) if frozen_cash is not None else None,
             market_value=float(market_value) if market_value is not None else None,
         )
+        if diagnostics.enabled():
+            diagnostics.trace(
+                "asset_native_mapping", account_id=account_id, detail_type=detail_type,
+                row_count=len(rows), market_value_derived=market_value_derived,
+                raw=diagnostics.native_fields(row, (
+                    "m_dAvailable", "m_dAvailableCash", "available_cash", "cash",
+                    "m_dBalance", "m_dAsset", "total_asset", "asset",
+                ) + _FROZEN_CASH_FIELDS + _MARKET_VALUE_FIELDS),
+                cash=snapshot.cash, frozen_cash=snapshot.frozen_cash,
+                market_value=snapshot.market_value, total_asset=snapshot.total_asset,
+            )
+        return snapshot

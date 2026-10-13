@@ -18,6 +18,7 @@ import traceback
 import uuid
 
 from .adapters.redis_common import decode_text
+from . import diagnostics
 from .code_utils import normalize_stock_code
 from .models import AccountSnapshot, OrderRef, OrderRequest
 
@@ -566,6 +567,7 @@ class BigQmtRpcHandlers:
         return METHOD_ALIASES.get(method, method)
 
     def handle(self, method, params=None):
+        """规范方法别名并检查权限；DEBUG 记录拦截原因，不记录完整参数。"""
         requested_method = str(method or "").strip()
         method = self._canonical_method(requested_method)
         params = dict(params or {})
@@ -576,6 +578,10 @@ class BigQmtRpcHandlers:
         # succeeded (issue #43).
         self._last_server_error = ""
         self._pending_settlement = None
+        if diagnostics.enabled():
+            diagnostics.trace("rpc_method_gate", requested_method=requested_method,
+                              canonical_method=method, allowed=method in self.allowed_methods,
+                              allow_order_methods=self.allow_order_methods)
         if not requested_method:
             raise ValueError("method is required")
         if method not in self.allowed_methods:
@@ -1514,6 +1520,11 @@ class BigQmtRpcHandlers:
         # Some QMT builds only expose down_history_data (same signature, 4 args).
         if func is None:
             func = self.qmt_api.get("down_history_data")
+        if diagnostics.enabled():
+            diagnostics.trace("history_download_route", stock_code=params.get("stock_code"),
+                              period=params.get("period", "1d"), start_time=params.get("start_time"),
+                              end_time=params.get("end_time"), incrementally=params.get("incrementally"),
+                              route="native_single" if func is not None else "market_adapter")
         if func is not None:
             try:
                 stock_code = str(params.get("stock_code") or "")
@@ -1523,6 +1534,9 @@ class BigQmtRpcHandlers:
                 if params.get("incrementally") is False and not start_time:
                     raise ValueError("大 QMT 非增量下载必须提供明确 start_time")
                 result = func(stock_code, period, start_time, end_time)
+                if diagnostics.enabled():
+                    diagnostics.trace("history_download_native_result", result=result,
+                                      interpreted_success=bool(result) if result is not None else True)
                 return bool(result) if result is not None else True
             except Exception as exc:
                 raise RuntimeError("download_history_data failed: %s" % exc)
@@ -1540,6 +1554,13 @@ class BigQmtRpcHandlers:
         start_time = str(params.get("start_time") or "")
         end_time = str(params.get("end_time") or "")
         func = self.qmt_api.get("download_history_data2")
+        if diagnostics.enabled():
+            diagnostics.trace("history_download_route", stock_count=len(stock_list),
+                              stocks=stock_list[:8], period=period, start_time=start_time,
+                              end_time=end_time, incrementally=params.get("incrementally"),
+                              route="native_batch" if func is not None else (
+                                  "native_single_fallback" if self.qmt_api.get("download_history_data")
+                                  or self.qmt_api.get("down_history_data") else "market_adapter"))
         if func is not None:
             try:
                 # Try with a no-op callback first (some QMT builds require it);
@@ -1547,7 +1568,12 @@ class BigQmtRpcHandlers:
                 try:
                     result = func(stock_list, period, start_time, end_time, lambda data: None)
                 except TypeError:
+                    if diagnostics.enabled():
+                        diagnostics.trace("history_download_signature_fallback", argument_count=4)
                     result = func(stock_list, period, start_time, end_time)
+                if diagnostics.enabled():
+                    diagnostics.trace("history_download_native_result", result=result,
+                                      interpreted_success=bool(result) if result is not None else True)
                 return bool(result) if result is not None else True
             except Exception as exc:
                 raise RuntimeError("download_history_data2 failed: %s" % exc)
@@ -1559,6 +1585,10 @@ class BigQmtRpcHandlers:
                 result = None
                 for code in stock_list:
                     result = single(code, period, start_time, end_time)
+                    if diagnostics.enabled():
+                        diagnostics.trace("history_download_native_result", stock_code=code,
+                                          result=result, interpreted_success=(
+                                              bool(result) if result is not None else True))
                     if result is not None and not bool(result):
                         return False
                 return bool(result) if result is not None else True
@@ -1774,7 +1804,14 @@ class BigQmtRpcHandlers:
         self._remember_order_identity_local(
             request.account_id, request.remark, request.strategy_name)
 
+        if diagnostics.enabled():
+            diagnostics.trace("submit_native_begin", order_remark=request.remark,
+                              stock_code=request.stock_code, action=request.action,
+                              volume=request.volume)
         result = self.order_gateway.submit(request)
+        if diagnostics.enabled():
+            diagnostics.trace("submit_native_end", order_remark=request.remark,
+                              gateway_order_id=getattr(result, "order_sys_id", None))
 
         # 委托后校验：确认委托是否真的进了系统。passorder 调用成功但委托没进
         # 系统时（静默失败），记录 server_error 让客户端知道。匹配严格按
@@ -2202,7 +2239,11 @@ class BigQmtRpcHandlers:
         return result
 
     def _settle_cancel_from_status(self, settlement, status, order_sys_id, final):
-        """One status answer, from the watch table or the snapshot row."""
+        """解释观察表或快照状态；原生返回成功不能代替已撤销事实。"""
+        if diagnostics.enabled():
+            diagnostics.trace("cancel_status_observed", gateway_order_id=order_sys_id,
+                              status=status, final=final, attempts=settlement.attempts,
+                              request_id=(settlement.request or {}).get("request_id"))
         if status in CANCELED_ORDER_STATUSES:
             settlement.result.success = True
             settlement.result.message = ""
@@ -2250,6 +2291,9 @@ class BigQmtRpcHandlers:
             except Exception:
                 watched = None
             if watched is not None:
+                if diagnostics.enabled():
+                    diagnostics.trace("cancel_lookup", gateway_order_id=order_sys_id,
+                                      source="watch_table", attempt=settlement.attempts)
                 return self._settle_cancel_from_status(
                     settlement, str(watched), order_sys_id, final)
         try:
@@ -2272,6 +2316,10 @@ class BigQmtRpcHandlers:
             order for order in orders
             if str(getattr(order, "order_sys_id", "") or "") == order_sys_id
         ]
+        if diagnostics.enabled():
+            diagnostics.trace("cancel_lookup", gateway_order_id=order_sys_id,
+                              source="query_orders", attempt=settlement.attempts,
+                              match_count=len(matches), final=final)
         if not matches:
             if not final:
                 return False
@@ -2611,7 +2659,11 @@ class RedisPubSubRpcService:
         self.enqueue_payload(raw_payload)
 
     def enqueue_payload(self, raw_payload):
+        """接收请求并排队；诊断时间戳仅在本进程生成，不信任调用方提供的值。"""
         payload = self._loads(raw_payload)
+        payload.pop("_debug_enqueued_at", None)
+        if diagnostics.enabled():
+            payload["_debug_enqueued_at"] = _monotonic()
         if self._should_process_in_listener(payload):
             self.process_request(payload)
             return
@@ -2712,6 +2764,13 @@ class RedisPubSubRpcService:
                 self._pending_settlements.put(settlement)
                 continue
             response = settlement.response
+            if diagnostics.enabled():
+                diagnostics.trace("rpc_settlement_complete",
+                                  request_id=settlement.request.get("request_id"),
+                                  method=settlement.request.get("method"),
+                                  attempts=settlement.attempts, deadline_reached=expired,
+                                  gateway_order_id=getattr(settlement.result, "order_sys_id", None),
+                                  success=getattr(settlement.result, "success", None))
             response["data"] = to_jsonable(settlement.result)
             response["ok"] = True
             if getattr(settlement, "server_error", ""):
@@ -2763,6 +2822,29 @@ class RedisPubSubRpcService:
         return processed
 
     def process_request(self, request):
+        """在 DEBUG 下关联请求并拆分排队与执行耗时；不开启时不构造诊断数据。"""
+        if not diagnostics.enabled():
+            return self._process_gated_request(request)
+        started = _monotonic()
+        request = dict(request or {})
+        enqueued = request.pop("_debug_enqueued_at", None)
+        with diagnostics.request_scope(request.get("request_id") or request.get("id"),
+                                       request.get("method")):
+            diagnostics.trace("rpc_execute_begin", queue_wait_ms=(
+                (started - enqueued) * 1000 if isinstance(enqueued, (int, float)) else None))
+            try:
+                result = self._process_gated_request(request)
+                diagnostics.trace("rpc_execute_end", elapsed_ms=(_monotonic() - started) * 1000,
+                                  ok=result.get("ok") if isinstance(result, dict) else None,
+                                  execution_gate_accepted=result is not None,
+                                  pending_settlements=self._pending_settlements.qsize())
+                return result
+            except Exception as exc:
+                diagnostics.trace("rpc_execute_failed", error_type=type(exc).__name__,
+                                  elapsed_ms=(_monotonic() - started) * 1000)
+                raise
+
+    def _process_gated_request(self, request):
         """在策略指定线程执行业务；支持执行门禁的传输需先确认请求仍有效。"""
         request = dict(request or {})
         scope = getattr(self._transport, "execution_scope", None)
@@ -2831,6 +2913,9 @@ class RedisPubSubRpcService:
                 self._deferred_count += 1
                 return response
         except Exception as exc:
+            if diagnostics.enabled():
+                diagnostics.trace("rpc_handler_failed", error_type=type(exc).__name__,
+                                  handler_attempted=handler_attempted)
             response["error"] = "%s: %s" % (exc.__class__.__name__, exc)
             response["error_code"] = getattr(exc, "error_code", "")
             if getattr(self._transport, "supports_execution_gate", False):

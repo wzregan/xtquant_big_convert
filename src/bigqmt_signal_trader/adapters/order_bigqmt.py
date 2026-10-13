@@ -5,6 +5,8 @@ The passorder signature follows src/api/qmt_jq_trade.
 
 import hashlib
 
+from .. import diagnostics
+
 
 class _QmtFallbackXtConstant(object):
     """QMT 策略沙箱没有可导入 xtquant package 时使用的最小常量集。"""
@@ -639,10 +641,14 @@ class BigQmtOrderGateway:
         }
 
     def cancel(self, order_ref, account_id=None):
+        """发送原生撤单；返回值只代表调用结果，终态仍由委托回报确认。"""
         cancel_func = self._require_cancel()
         aid = account_id or self.account_id
         account_type = self._resolve_account_type(aid)
         ok = cancel_func(order_ref.order_sys_id, aid, account_type, self.context_info)
+        if diagnostics.enabled():
+            diagnostics.trace("cancel_native_result", gateway_order_id=order_ref.order_sys_id,
+                              raw_result=ok, raw_result_type=type(ok).__name__)
         return CancelResult(success=bool(ok), message="" if ok else "cancel returned false")
 
     def query_orders(self, account_id, strategy_name):
@@ -735,6 +741,7 @@ class BigQmtOrderGateway:
             return []
 
     def query_trades_strict(self, account_id, strategy_name):
+        """读取原生成交；诊断最多展示八条费用映射，避免轮询时展开整日记录。"""
         query = self._require_query_func()
         account_type = self._resolve_account_type(account_id)
         rows = []
@@ -756,6 +763,15 @@ class BigQmtOrderGateway:
         name_cache = {}
         for row in rows:
             traded_at_raw = _attr(row, ("m_strTradeTime", "trade_time", "traded_at"), "")
+            if diagnostics.enabled() and len(result) < 8:
+                diagnostics.trace("trade_query_mapping", detail_type=detail_type,
+                                  row_count=len(rows), preview_index=len(result),
+                                  raw=diagnostics.native_fields(row, (
+                                      "m_strTradeID", "m_strOrderSysID", "m_dComssion",
+                                      "m_dCommission", "commission", "m_dTradeAmount")),
+                                  commission=_first_nonzero(
+                                      row, ("m_dComssion", "m_dCommission", "commission"),
+                                      default=None))
             try:
                 stock_code = _full_code(
                     _attr(row, ("m_strInstrumentID", "instrument_id", "stock_code")),
