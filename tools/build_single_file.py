@@ -96,6 +96,7 @@ def main():
     print("embedded raw bytes: %d" % total)
 
 
+# 模板中的 qmt_extra 必须显式转交行情下载函数：QMT 只向策略命名空间注入它们。
 TEMPLATE = '''#coding:gbk
 """Single-file self-contained Big QMT Redis dry-run strategy.
 
@@ -365,6 +366,7 @@ try:
         "get_enable_short_contract", "get_unclosed_compacts", "get_closed_compacts",
         "get_debt_contract", "get_option_subject_position", "get_comb_option",
         "get_hkt_exchange_rate",
+        "download_history_data", "download_history_data2", "down_history_data",
     ):
         if function_name in globals():
             qmt_extra[function_name] = globals()[function_name]

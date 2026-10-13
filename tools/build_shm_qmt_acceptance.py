@@ -83,6 +83,9 @@ def _shm_acceptance_apply_profile():
     allowed = {method for method in handlers.READ_METHODS
                if method not in excluded and not method.startswith("download_")
                and not method.startswith("submit_download_")}
+    if BIGQMT_ACCEPTANCE_HISTORY_DOWNLOAD:
+        # 历史 Tick 缺口补齐依赖同步下载；只开放行情下载，不启动后台任务或财务全量下载。
+        allowed.update({"download_history_data", "download_history_data2"})
     if _SHM_ACCEPTANCE_TRADING:
         allowed.update(handlers.ORDER_METHODS)
     rpc["allowed_methods"] = sorted(allowed)
@@ -214,8 +217,13 @@ _shm_acceptance_apply_profile()
 
 
 def build_acceptance(output, account_id, account_type="STOCK", namespace=DEFAULT_NAMESPACE,
-                     directory=None, mode="read-only"):
-    """构建 ASCII/GBK 单文件；mode 明确只读或正式交易，账号/namespace 两端须一致。"""
+                     directory=None, mode="read-only", allow_history_download=False, debug=False):
+    """构建 ASCII/GBK 单文件；账号/namespace 两端须一致，mode 决定交易权限。
+
+    allow_history_download 显式开放历史行情缓存写入，独立于交易权限，默认关闭。
+    debug 仅开启面板诊断，不启用文件日志、网络或更改交易权限，默认关闭。
+    directory 仅用于 POSIX 本机回归，不应设置为 Windows 部署目录。
+    """
     account_id = str(account_id).strip()
     if not account_id or not str(namespace).strip():
         raise ValueError("account_id and namespace must not be empty")
@@ -237,9 +245,12 @@ def build_acceptance(output, account_id, account_type="STOCK", namespace=DEFAULT
     start = source.index('BIGQMT_ACCOUNT_ID = "YOUR_ACCOUNT_ID"')
     end = source.index("# ===================================================================", start)
     block = ("BIGQMT_ACCOUNT_ID = %s\nBIGQMT_ACCOUNT_TYPE = %s\n"
-             "BIGQMT_ACCEPTANCE_MODE = %s\nBIGQMT_REDIS_CONFIG = %s\n") % (
+             "BIGQMT_ACCEPTANCE_MODE = %s\nBIGQMT_ACCEPTANCE_HISTORY_DOWNLOAD = %r\n"
+             "BIGQMT_DEBUG = %r\nos.environ['BIGQMT_DEBUG'] = '1' if BIGQMT_DEBUG else '0'\n"
+             "BIGQMT_REDIS_CONFIG = %s\n") % (
         json.dumps(account_id, ensure_ascii=True), json.dumps(account_type, ensure_ascii=True),
-        json.dumps(mode_label), pprint.pformat(settings, width=100))
+        json.dumps(mode_label), bool(allow_history_download), bool(debug),
+        pprint.pformat(settings, width=100))
     source = source[:start] + block + source[end:]
     source = source.replace("Single-file self-contained Big QMT Redis dry-run strategy.",
                             "Formal Big QMT SHM %s strategy (TEST4_SHM_BRIDGE_V1)." % mode_label, 1)
@@ -263,6 +274,8 @@ def build_acceptance(output, account_id, account_type="STOCK", namespace=DEFAULT
                 "file": os.path.basename(output), "sha256": hashlib.sha256(data).hexdigest(),
                 "bytes": len(data), "client_config": client,
                 "allow_order_methods": mode == "trading", "auto_submit": False,
+                "allow_history_download": bool(allow_history_download),
+                "debug": bool(debug),
                 "rpc_background_threads": False, "warm_context_data": False,
                 "grpc_companion": {"enabled": False, "auto_start": False},
                 "embedded_sha256": {key: hashlib.sha256(base64.b64decode(value)).hexdigest()
@@ -285,8 +298,12 @@ def main():
     parser.add_argument("--mode", choices=tuple(MODES), default="read-only",
                         help="trading 开放正式交易 RPC；两种模式都不自动产生订单")
     parser.add_argument("--directory", help="POSIX 本机回归目录，Windows 部署不要设置")
+    parser.add_argument("--allow-history-download", action="store_true",
+                        help="开放历史行情缓存补下载；独立于交易权限，不启用后台下载任务")
+    parser.add_argument("--debug", action="store_true", help="开启有界面板诊断，默认关闭")
     args = parser.parse_args()
-    build_acceptance(args.output, args.account_id, args.account_type, args.namespace, args.directory, args.mode)
+    build_acceptance(args.output, args.account_id, args.account_type, args.namespace, args.directory, args.mode,
+                     args.allow_history_download, args.debug)
 
 
 if __name__ == "__main__":

@@ -61,6 +61,9 @@ def test_artifact_is_ascii_gbk_and_embeds_exact_current_shm_sources(built_test4)
     assert client["shm"]["namespace"] == "Local\\bigqmt-test4-shm-v1"
     assert client["formula_server"] == {"enabled": False}
     assert client["redis_enabled"] is False
+    assert manifest["allow_history_download"] is False
+    assert manifest["debug"] is False
+    assert b"BIGQMT_DEBUG = False" in data
 
 
 WORKER = r'''
@@ -76,7 +79,8 @@ path, mode, sdk_root = sys.argv[1:]
 sys.path.insert(0, sdk_root)
 namespace = {"__name__": "offline_test4", "__file__": path,
              "passorder": Mock(side_effect=AssertionError("native order forbidden")),
-             "cancel": Mock(side_effect=AssertionError("native cancel forbidden"))}
+             "cancel": Mock(side_effect=AssertionError("native cancel forbidden")),
+             "down_history_data": Mock(return_value=True)}
 with open(path, "rb") as stream:
     exec(compile(stream.read(), path, "exec"), namespace)
 socket.socket = Mock(side_effect=AssertionError("network socket forbidden"))
@@ -142,7 +146,10 @@ try:
     forbidden = {"submit_order", "submit_orders_batch", "cancel_order", "passorder",
                  "download_history_data", "reload_deployment", "smt_appointment",
                  "create_sector", "create_sector_folder", "add_stock_to_sector",
-                 "remove_stock_from_sector", "reset_sector_stock_list", "add_sector", "remove_sector"}
+                 "remove_stock_from_sector", "reset_sector_stock_list", "add_sector", "remove_sector",
+                 "download_financial_data", "submit_download_history_data2"}
+    if mode == "history_download":
+        forbidden.remove("download_history_data")
     assert not (forbidden & service.handlers.allowed_methods)
     sdk = load("bigqmt_signal_trader.xtquant_compat")
     sdk.load_client_config = lambda: {}
@@ -172,6 +179,10 @@ try:
         try:
             result["ping"] = client.call("ping", use_formula=False)
             result["ticks"] = client.call("get_ticks", {"codes": ["510300.SH"]}, use_formula=False)
+            if mode == "history_download":
+                result["download"] = client.call("download_history_data2", {
+                    "stock_list": ["510300.SH"], "period": "tick",
+                    "start_time": "20261013100000", "end_time": "20261013100100"}, use_formula=False)
             sub = client.call("subscribe_whole_quote", {"codes": ["510300.SH"],
                               "client_id": "offline-quote", "sub_id": "offline-sub"}, use_formula=False)
             channel.start_subscriber([sub["topic"]], consume)
@@ -213,7 +224,14 @@ try:
     assert result["quote"] == {"510300.SH": {"lastPrice": 4.2}}
     assert result["write_rejected"] is True
     assert all(item == main_thread for item in handler_threads + native_calls)
-    assert service._transport.status()["executed"] == 4
+    expected_calls = 5 if mode == "history_download" else 4
+    assert service._transport.status()["executed"] == expected_calls
+    if mode == "history_download":
+        assert result["download"] is True
+        namespace["down_history_data"].assert_called_once_with(
+            "510300.SH", "tick", "20261013100000", "20261013100100")
+    else:
+        namespace["down_history_data"].assert_not_called()
     namespace["_shm_acceptance_state"]["last_log"] -= 11.0
     namespace["adjust"](context)
     namespace["handlebar"](context)
@@ -221,7 +239,7 @@ try:
     namespace["cancel"].assert_not_called()
     redis_common.build_redis_client.assert_not_called()
     socket.socket.assert_not_called()
-    print("OFFLINE_ACCEPTANCE " + json.dumps({"rpc_executed": 4, "push_acknowledged": 1,
+    print("OFFLINE_ACCEPTANCE " + json.dumps({"rpc_executed": expected_calls, "push_acknowledged": 1,
           "native_main_thread": True, "write_rejected": True, "redis_calls": 0, "socket_calls": 0}))
 finally:
     if channel is not None:
@@ -232,10 +250,16 @@ finally:
 '''
 
 
-@pytest.mark.parametrize("mode", ["formal_bridge", "missing_scheduler"])
-def test_built_test4_executes_real_native_init_adjust_rpc_and_ack_push(built_test4, mode):
+@pytest.mark.parametrize("mode", ["formal_bridge", "missing_scheduler", "history_download"])
+@pytest.mark.parametrize("debug", [False, True])
+def test_built_test4_executes_real_native_init_adjust_rpc_and_ack_push(built_test4, mode, debug):
     """子进程隔离嵌入加载器，真正执行完整 init/adjust/服务/SDK/推送，而非原语探针。"""
     path, _ = built_test4
+    if mode == "history_download" or debug:
+        manifest = BUILDER.build_acceptance(str(path), "offline-acceptance", directory=str(path.parent),
+                                           allow_history_download=mode == "history_download", debug=debug)
+        assert manifest["allow_history_download"] is (mode == "history_download")
+        assert manifest["debug"] is debug
     completed = subprocess.run([sys.executable, "-c", WORKER, str(path), mode, os.path.join(ROOT, "src")],
                                cwd=str(path.parent),
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)
@@ -243,12 +267,17 @@ def test_built_test4_executes_real_native_init_adjust_rpc_and_ack_push(built_tes
     assert completed.returncode == 0, output
     summary = next(json.loads(line[len("OFFLINE_ACCEPTANCE "):]) for line in output.splitlines()
                    if line.startswith("OFFLINE_ACCEPTANCE "))
-    if mode == "formal_bridge":
-        assert summary["rpc_executed"] == 4
+    if mode in ("formal_bridge", "history_download"):
+        assert ("[bigqmt_debug]" in output) is debug
+        if debug:
+            assert '"event": "rpc_execute_begin"' in output
+            assert '"event": "rpc_method_gate"' in output
+        expected_calls = 5 if mode == "history_download" else 4
+        assert summary["rpc_executed"] == expected_calls
         assert summary["push_acknowledged"] == 1
         assert "INIT_OK READ_ONLY rpc=shm push=shm background_threads=False" in output
         assert "HEARTBEAT READ_ONLY" in output
-        assert "rpc_executed=4" in output
+        assert "rpc_executed=%d" % expected_calls in output
         assert "STOP_OK" in output
     else:
         assert summary["missing_scheduler_rejected"] is True
