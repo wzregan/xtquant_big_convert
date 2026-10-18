@@ -3833,6 +3833,7 @@ class BigQmtXtTrader:
         ][0]
 
     def query_stock_orders(self, account, cancelable_only=False, strategy_name=""):
+        """查询委托快照并整批转换对象，标准 SDK 可批量完成持久编号映射。"""
         # strategy_name 默认 ""（返回全部）：与服务端一致，避免下单用的策略名
         # 与查询默认值不匹配导致委托查不到（strategy_name 陷阱）。
         account_id = _account_id(account, self.client.account_id)
@@ -3845,7 +3846,11 @@ class BigQmtXtTrader:
             },
             account_id=account_id,
         ) or []
-        return [self._order_from_dict(account_id, item) for item in _as_list(data)]
+        return self._orders_from_rows(account_id, _as_list(data))
+
+    def _orders_from_rows(self, account_id, rows):
+        """转换一批委托事实，直接桥接入口保持原编号与逐行字段语义。"""
+        return [self._order_from_dict(account_id, item) for item in rows]
 
     def query_stock_order(self, account, order_id):
         order_id = str(order_id or "")
@@ -3855,6 +3860,7 @@ class BigQmtXtTrader:
         return None
 
     def query_stock_trades(self, account, strategy_name=""):
+        """查询成交快照并整批转换对象，保留每条成交的原始字段。"""
         # 默认 "" = 查询账户全部成交 (与服务端 _handle_query_trades 一致)。
         # 旧默认 "bigqmt_signal_trader" 会过滤掉其他策略名的成交;
         # 按策略过滤时由调用方显式传入。
@@ -3864,7 +3870,11 @@ class BigQmtXtTrader:
             {"account_id": account_id, "strategy_name": strategy_name},
             account_id=account_id,
         ) or []
-        return [self._trade_from_dict(account_id, item) for item in _as_list(data)]
+        return self._trades_from_rows(account_id, _as_list(data))
+
+    def _trades_from_rows(self, account_id, rows):
+        """转换一批成交事实，允许标准 SDK 为整批委托身份复用数据库连接。"""
+        return [self._trade_from_dict(account_id, item) for item in rows]
 
     def describe_trade_detail_fields(self, account, detail_types=None):
         """Which attributes QMT's own ORDER / DEAL rows carry. Names only.
@@ -3913,7 +3923,7 @@ class BigQmtXtTrader:
         order_strategy_name="bigqmt_signal_trader",
         trade_strategy_name="",
     ):
-        """Query orders and account-wide trades in one RPC round trip."""
+        """一次 RPC 查询委托和账户全部成交，分别按整批转换以保持编号映射效率。"""
         account_id = _account_id(account, self.client.account_id)
         data = self.client.call(
             "query_execution_snapshot",
@@ -3925,14 +3935,8 @@ class BigQmtXtTrader:
             account_id=account_id,
         ) or {}
         result = dict(data) if isinstance(data, dict) else {}
-        result["orders"] = [
-            self._order_from_dict(account_id, item)
-            for item in _as_list(result.get("orders"))
-        ]
-        result["trades"] = [
-            self._trade_from_dict(account_id, item)
-            for item in _as_list(result.get("trades"))
-        ]
+        result["orders"] = self._orders_from_rows(account_id, _as_list(result.get("orders")))
+        result["trades"] = self._trades_from_rows(account_id, _as_list(result.get("trades")))
         return result
 
     def order_stock(
@@ -5048,7 +5052,8 @@ class BigQmtXtTrader:
         except Exception:
             return 2
 
-    def _order_from_dict(self, account_id, item):
+    def _order_from_dict(self, account_id, item, order_id=None):
+        """转换单条委托；order_id 非空时使用调用方已确定的编号，避免重复映射身份。"""
         action = item.get("action")
         order_type = _action_to_order_type(action)
         order_sysid = str(item.get("order_sys_id") or item.get("order_sysid") or item.get("order_id") or "")
@@ -5073,8 +5078,8 @@ class BigQmtXtTrader:
             order_sysid=order_sysid,
             # MiniQMT: order_id is the int 委托编号, order_sysid the string
             # 柜台编号. Both, from one 合同编号 (issue #113).
-            order_id=self._order_object_id(
-                order_sysid or str(item.get("user_order_id") or "")),
+            order_id=(self._order_object_id(order_sysid or str(item.get("user_order_id") or ""))
+                      if order_id is None else order_id),
             strategy_name=str(item.get("strategy_name") or ""),
             order_remark=str(item.get("remark") or item.get("user_order_id") or ""),
             # MiniQMT XtOrder.order_time 是 Unix 秒。服务端订单事件只发
@@ -5094,7 +5099,8 @@ class BigQmtXtTrader:
             direction=item.get("direction"),
         )
 
-    def _trade_from_dict(self, account_id, item):
+    def _trade_from_dict(self, account_id, item, order_id=None):
+        """转换单条成交；order_id 非空时复用已确定编号，其他字段保持原始事实语义。"""
         action = item.get("action")
         order_type = _action_to_order_type(action)
         order_sysid = str(item.get("order_sys_id") or item.get("order_sysid") or "")
@@ -5110,7 +5116,7 @@ class BigQmtXtTrader:
             stock_code=_full_a_share_code(item.get("stock_code")),
             order_type=order_type,
             order_sysid=order_sysid,
-            order_id=self._order_object_id(order_sysid),
+            order_id=self._order_object_id(order_sysid) if order_id is None else order_id,
             trade_id=trade_id,
             # MiniQMT 字段契约: traded_id/traded_time 是业务代码读取的名字。
             traded_id=trade_id,

@@ -290,18 +290,18 @@ class XtQuantTrader(BigQmtXtTrader):
         result["execution_context"] = context
         return result
 
-    def _order_from_dict(self, account_id, item):
-        """查询与回调统一按账户、委托日期和原始合同号映射。"""
-        result = super(XtQuantTrader, self)._order_from_dict(account_id, item)
-        result.order_id = self._registry().remember(
+    def _order_from_dict(self, account_id, item, order_id=None):
+        """查询与回调按真实委托日期映射；order_id 可传入已批量解析的编号或占位零。"""
+        result = super(XtQuantTrader, self)._order_from_dict(account_id, item, order_id=0)
+        result.order_id = order_id if order_id is not None else self._registry().remember(
             account_id, trading_date(result.order_time), result.order_sysid
         )
         return result
 
-    def _trade_from_dict(self, account_id, item):
-        """成交使用同一合同号映射；费用字段继续保留未知值。"""
-        result = super(XtQuantTrader, self)._trade_from_dict(account_id, item)
-        result.order_id = self._registry().remember(
+    def _trade_from_dict(self, account_id, item, order_id=None):
+        """成交按真实日期映射且保留未知费用；order_id 为批量路径已确定的编号或占位零。"""
+        result = super(XtQuantTrader, self)._trade_from_dict(account_id, item, order_id=0)
+        result.order_id = order_id if order_id is not None else self._registry().remember(
             account_id, trading_date(result.traded_time), result.order_sysid
         )
         # 原兼容层把缺少费用填成零；账本必须区分「免佣」和「费用尚未返回」。
@@ -309,6 +309,28 @@ class XtQuantTrader(BigQmtXtTrader):
             None if item.get("commission") is None else float(item["commission"])
         )
         return result
+
+    def _orders_from_rows(self, account_id, rows):
+        """整批映射委托身份，不让全量历史超过 LRU 容量后反复逐行打开 SQLite。"""
+        return self._mapped_query_rows(account_id, rows, False)
+
+    def _trades_from_rows(self, account_id, rows):
+        """整批映射成交关联委托，重复成交引用同一持久整数编号。"""
+        return self._mapped_query_rows(account_id, rows, True)
+
+    def _mapped_query_rows(self, account_id, rows, trades):
+        """先转换字段，再一次取得本批身份映射；trades 选择成交时间或委托时间。"""
+        convert = self._trade_from_dict if trades else self._order_from_dict
+        objects = [convert(account_id, item, order_id=0) for item in rows]
+        if not objects:
+            return objects
+        identities = [
+            (account_id, trading_date(item.traded_time if trades else item.order_time), item.order_sysid)
+            for item in objects
+        ]
+        for item, identifier in zip(objects, self._registry().remember_many(identities)):
+            item.order_id = identifier
+        return objects
 
     def _resolve_order_sys_id(self, value):
         """整数必须在映射库中存在；显式字符串保持柜台系统号语义。"""
