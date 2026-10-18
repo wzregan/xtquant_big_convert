@@ -218,6 +218,56 @@ def test_retention_expiration_is_gap_and_frees_capacity(factory):
         client.start_subscriber(["exec:order"], lambda topic, data: None)
 
 
+def test_explicit_quote_resubscribe_after_expiry_establishes_a_fresh_cursor(factory):
+    """正常停止的原行情持有者可以主动新订阅，并沿当前日志建立全新基线。"""
+    server = factory("server", subscriber_retention_seconds=0)
+    client = factory("client", "quote", subscriber_retention_seconds=0)
+    server.start_publisher()
+    first = []
+    client.start_subscriber(["ticks:first"], lambda topic, data: first.append(data))
+    server.publish("ticks:first", 1)
+    _wait(lambda: client.status()["acknowledged"] == 1)
+    client.stop()
+    # 足够多的新消息回收旧行情；重新订阅绝不能继承已经落在日志头之前的游标。
+    for value in range(10):
+        server.publish("ticks:second", value)
+    client.update_topics(["ticks:second"])
+    second = []
+    client.start_subscriber(["ticks:second"], lambda topic, data: second.append(data))
+    server.publish("ticks:second", 10)
+    _wait(lambda: bool(second) and second[-1] == 10)
+    assert first == [1]
+    assert client.check_health()["error"] == ""
+
+
+def test_expired_quote_identity_without_explicit_owner_intent_still_reports_gap(factory):
+    """单纯重试及另一个实例复用行情身份，都不能绕过已过期订阅的缺口检查。"""
+    server = factory("server", subscriber_retention_seconds=0)
+    client = factory("client", "quote", subscriber_retention_seconds=0)
+    server.start_publisher()
+    client.start_subscriber(["ticks"], lambda topic, data: None)
+    client.stop()
+    with server._region.locked(1):
+        server._maintain_consumers()
+    with pytest.raises(PushGapError, match="retention expired"):
+        client.start_subscriber(["ticks"], lambda topic, data: None)
+    replacement = factory("client", "quote", subscriber_retention_seconds=0)
+    with pytest.raises(PushGapError, match="retention expired"):
+        replacement.start_subscriber(["ticks"], lambda topic, data: None)
+
+
+def test_explicit_topic_update_cannot_reset_expired_execution_cursor(factory):
+    """交易订阅即使是原持有者主动更新主题，也必须继续报告过期缺口。"""
+    server = factory("server", subscriber_retention_seconds=0)
+    client = factory("client", "trades", subscriber_retention_seconds=0)
+    server.start_publisher()
+    client.start_subscriber(["exec:order"], lambda topic, data: None)
+    client.stop()
+    client.update_topics(["exec:trade"])
+    with pytest.raises(PushGapError, match="retention expired"):
+        client.start_subscriber(["exec:trade"], lambda topic, data: None)
+
+
 def test_epoch_restart_is_reported_to_existing_subscriber(factory):
     """发布者重启后旧订阅不得跨代次假装消息连续。"""
     server, client = factory("server"), factory("client", "stable")
@@ -445,10 +495,14 @@ def test_publish_lock_wait_respects_total_budget(factory):
     try:
         assert entered.wait(1)
         start = time.monotonic()
-        with pytest.raises(PushBackpressureError, match="lock budget"):
+        with pytest.raises(PushBackpressureError, match="lock budget") as publish_busy:
             server.publish("exec:order", 1, timeout_seconds=0)
+        assert publish_busy.value.lock_busy is True
         assert time.monotonic() - start < 0.1
         assert server.status()["published"] == 0
+        with pytest.raises(PushBackpressureError, match="health check lock busy") as health_busy:
+            server.check_health()
+        assert health_busy.value.lock_busy is True
     finally:
         release.set()
         thread.join(2)

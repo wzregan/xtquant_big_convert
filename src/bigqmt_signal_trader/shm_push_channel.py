@@ -1,7 +1,9 @@
 """有界共享内存推送日志：独立消费者确认、显式背压以及故障可见性。"""
 
+import contextlib
 import hashlib
 import json
+import os
 import struct
 import threading
 import time
@@ -26,6 +28,12 @@ class PushBackpressureError(SharedMemoryPushError):
     """容量或锁预算暂时不足，本次消息尚未提交，可以有界重试。"""
 
     retryable = True
+
+
+class PushLockBusyError(PushBackpressureError):
+    """共享元数据锁暂不可用；不代表日志容量已满，原消息尚未提交。"""
+
+    lock_busy = True
 
 
 class PushGapError(SharedMemoryPushError):
@@ -139,6 +147,7 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
         self._space_signal = None
         self._data_signal = None
         self._signals = {}
+        self._signals_lock = threading.Lock()
         self._epoch = None
         self._slot = None
         self._topics = set()
@@ -253,7 +262,7 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
         return payload
 
     def _validate(self, abandoned=False):
-        """校验协议、发布代次及发布者存活，锁所有者异常退出一律失败关闭。"""
+        """在锁内只核对协议、代次与故障位；存活检查由 _validated_lock 在锁外完成。"""
         if abandoned:
             header = self._header()
             if header.magic == _MAGIC:
@@ -273,9 +282,89 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
             raise SharedMemoryPushError("shared push layout mismatch")
         if self._epoch is not None and header.epoch != self._epoch:
             raise PushGapError("shared push publisher epoch changed; explicit recovery required")
-        if header.health or not header.pid or not process_alive(header.pid, header.birth):
+        if header.health or not header.pid:
             raise PushGapError("shared push publisher is stopped or unhealthy")
         return header
+
+    def _peer_alive(self, pid, birth):
+        """当前执行进程的完整身份可直接证明存活，其余身份每轮重新向操作系统查询。"""
+        if pid == os.getpid() == self._pid and birth == self._birth:
+            return True
+        return process_alive(pid, birth)
+
+    @contextlib.contextmanager
+    def _validated_lock(self, timeout_seconds, maintain=False, allow_missing=False,
+                        force_maintenance=False, deadline=None):
+        """先快照、锁外探活、再锁内核对身份并交付锁，所有等待共用秒数预算。
+
+        maintain 仅在消费者表版本变化或维护到期时探活；回收使用同槽位同token的死亡证据。
+        force_maintenance 用于日志满时立即重查死亡消费者，不能等待维护周期才回收容量。
+        deadline 为上层循环已有的单调时钟截止；保留原始正预算，不能把到期剩余零秒当成显式零预算。
+        allow_missing 用于首次订阅，发布者尚未出现或已退出时返回 None，由启动期限控制重试。
+        零预算仍允许两次无等待抢锁；正预算包含系统探活，过期后不得继续交付可写锁。
+        """
+        budget = max(0.0, float(timeout_seconds))
+        if deadline is None:
+            deadline = time.monotonic() + budget
+        if budget and time.monotonic() >= deadline:
+            raise TransportTimeout("shared push operation budget exhausted")
+        region = self._region
+        if region is None:
+            raise SharedMemoryPushError("shared push channel is not started")
+        # 两段锁之间仍保有映射生命周期；并发close只能等待或使第二次加锁明确失败。
+        with region._operation():
+            with region.locked(min(self.lock_timeout, max(0.0, deadline - time.monotonic()))) as abandoned:
+                if self._region is not region:
+                    raise PushGapError("shared push mapping changed during operation")
+                if abandoned:
+                    self._validate(abandoned=True)
+                header = self._header() if allow_missing else self._validate()
+                owner = (header.epoch, header.pid, header.birth)
+                ready = header.magic == _MAGIC and bool(header.pid)
+                if allow_missing and ready:
+                    self._validate()
+                generation = _GENERATION.unpack_from(region.buffer, 96)[0]
+                refresh = maintain and ready and (
+                    force_maintenance or generation != self._consumer_generation
+                    or time.monotonic() >= self._next_maintenance
+                )
+                candidates = [
+                    (slot, self._consumer(slot)) for slot in range(self.max_consumers)
+                ] if refresh else ()
+            # /proc与Windows进程句柄调用可能释放GIL，绝不能让它们阻塞共享元数据锁。
+            alive = ready and self._peer_alive(header.pid, header.birth)
+            dead = {
+                (slot, consumer.identity, consumer.token, consumer.pid, consumer.birth)
+                for slot, consumer in candidates
+                if consumer.state in (_ACTIVE, _FAILED)
+                and not self._peer_alive(consumer.pid, consumer.birth)
+            }
+            if budget and time.monotonic() >= deadline:
+                raise TransportTimeout("shared push liveness check exhausted operation budget")
+            with region.locked(min(self.lock_timeout, max(0.0, deadline - time.monotonic()))) as abandoned:
+                if self._region is not region:
+                    raise PushGapError("shared push mapping changed during operation")
+                if abandoned:
+                    self._validate(abandoned=True)
+                if budget and time.monotonic() >= deadline:
+                    raise TransportTimeout("shared push liveness check exhausted operation budget")
+                current = self._header()
+                if (current.epoch, current.pid, current.birth) != owner:
+                    if allow_missing:
+                        yield None
+                        return
+                    raise PushGapError("shared push publisher identity changed during liveness check")
+                if allow_missing and not alive:
+                    yield None
+                    return
+                self._validate()
+                if not alive:
+                    raise PushGapError("shared push publisher is stopped or unhealthy")
+                if refresh:
+                    self._consumer_cache = self._maintain_consumers(dead)
+                    self._consumer_generation = _GENERATION.unpack_from(region.buffer, 96)[0]
+                    self._next_maintenance = time.monotonic() + min(1.0, max(0.01, self.retention))
+                yield current
 
     def start_publisher(self):
         """取得单发布者所有权；重启显式开启新代次，使旧消费者报告不连续。"""
@@ -287,20 +376,30 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
         deadline = time.monotonic() + self.init_timeout
         self._open(max(0.0, deadline - time.monotonic()))
         try:
-            with self._region.locked(max(0.0, deadline - time.monotonic())):
-                previous = self._header()
-                if previous.pid and process_alive(previous.pid, previous.birth):
-                    raise SharedMemoryPushError("shared push publisher already owns this account and namespace")
-                self._epoch = uuid.uuid4().bytes
-                # 只初始化元数据；数据区由提交索引限定，无须每次清零 32 MiB。
-                self._region.buffer[:self._data_offsets[0]] = b"\0" * self._data_offsets[0]
-                header = _Header(_MAGIC, _VERSION, self._epoch, self._pid, self._birth,
-                                 self.capacities[0], self.capacities[1],
-                                 self.slot_counts[0], self.slot_counts[1], self.max_consumers, 0)
-                _HEADER.pack_into(self._region.buffer, 0, *header)
-                _CODEC.pack_into(self._region.buffer, 104, self._codec_id)
-                self._write_lane(0, _Lane(1, 1, 0, 0))
-                self._write_lane(1, _Lane(1, 1, 0, 0))
+            with self._region._operation():
+                with self._region.locked(max(0.0, deadline - time.monotonic())):
+                    previous = self._header()
+                alive = previous.pid and self._peer_alive(previous.pid, previous.birth)
+                if self.init_timeout and time.monotonic() >= deadline:
+                    raise TransportTimeout("shared push publisher initialization budget exhausted")
+                with self._region.locked(max(0.0, deadline - time.monotonic())):
+                    # 竞争者可能已完成接管，旧探活结果绝不能覆盖它的新代次。
+                    if self._header() != previous:
+                        raise SharedMemoryPushError("shared push publisher ownership changed during initialization")
+                    if self.init_timeout and time.monotonic() >= deadline:
+                        raise TransportTimeout("shared push publisher initialization budget exhausted")
+                    if alive:
+                        raise SharedMemoryPushError("shared push publisher already owns this account and namespace")
+                    self._epoch = uuid.uuid4().bytes
+                    # 只初始化元数据；数据区由提交索引限定，无须每次清零 32 MiB。
+                    self._region.buffer[:self._data_offsets[0]] = b"\0" * self._data_offsets[0]
+                    header = _Header(_MAGIC, _VERSION, self._epoch, self._pid, self._birth,
+                                     self.capacities[0], self.capacities[1],
+                                     self.slot_counts[0], self.slot_counts[1], self.max_consumers, 0)
+                    _HEADER.pack_into(self._region.buffer, 0, *header)
+                    _CODEC.pack_into(self._region.buffer, 104, self._codec_id)
+                    self._write_lane(0, _Lane(1, 1, 0, 0))
+                    self._write_lane(1, _Lane(1, 1, 0, 0))
             self._error = None
             self._published_ids.clear()
             self._consumer_generation = None
@@ -309,14 +408,15 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
             self._close_handles()
             raise
 
-    def _maintain_consumers(self):
-        """回收死亡临时消费者；稳定消费者保留到期后留下明确的缺口墓碑。"""
+    def _maintain_consumers(self, dead=()):
+        """锁内仅应用锁外取得的同身份死亡证据及到期规则，保留期间推进的最新ACK。"""
         now = int(time.time() * 1000000000)
         consumers = []
         changed = False
         for slot in range(self.max_consumers):
             consumer = self._consumer(slot)
-            if consumer.state in (_ACTIVE, _FAILED) and not process_alive(consumer.pid, consumer.birth):
+            identity = (slot, consumer.identity, consumer.token, consumer.pid, consumer.birth)
+            if consumer.state in (_ACTIVE, _FAILED) and (consumer.pid <= 0 or identity in dead):
                 if consumer.stable & (1 | _CALLBACK_FAILED_FLAG):
                     consumer = consumer._replace(state=_RETAINED, expires=now + int(self.retention * 1000000000))
                 else:
@@ -369,18 +469,31 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
 
     def _notify(self, consumers, lane):
         """提交后尽力唤醒；失败仅记录，不能把已提交消息伪装为未提交。"""
-        for slot, consumer in consumers:
-            if consumer.state != _ACTIVE or not ((consumer.stable >> 1) & (1 << lane)):
-                continue
-            try:
-                signal = self._signals.get(consumer.identity)
-                if signal is None:
-                    signal = NamedSignal(self._signal_name(consumer.identity), directory=self.directory)
-                    self._signals[consumer.identity] = signal
-                if signal.set() is False:
-                    self._missed_hints += 1
-            except Exception:
-                self._signal_errors += 1
+        # 通知在共享区域锁外执行，独立锁防止并发发布重复打开同名句柄。
+        # 临时订阅重连会更换身份，及时关闭离线身份，句柄数才受消费者槽位上限约束。
+        active = {consumer.identity for slot, consumer in consumers if consumer.state == _ACTIVE}
+        with self._signals_lock:
+            if not self._started:
+                # 停止可发生在消息提交和锁外通知之间，此时不能重新打开已回收的句柄。
+                return
+            for identity in list(self._signals):
+                if identity not in active:
+                    try:
+                        self._signals.pop(identity).close()
+                    except Exception:
+                        self._signal_errors += 1
+            for slot, consumer in consumers:
+                if consumer.state != _ACTIVE or not ((consumer.stable >> 1) & (1 << lane)):
+                    continue
+                try:
+                    signal = self._signals.get(consumer.identity)
+                    if signal is None:
+                        signal = NamedSignal(self._signal_name(consumer.identity), directory=self.directory)
+                        self._signals[consumer.identity] = signal
+                    if signal.set() is False:
+                        self._missed_hints += 1
+                except Exception:
+                    self._signal_errors += 1
 
     def publish(self, topic, data, message_id=None, timeout_seconds=None):
         """提交消息；timeout_seconds 覆盖总等待预算，0 表示立即尝试。
@@ -401,10 +514,11 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
             {"timeout": timeout_seconds}, "timeout", self.publish_timeout)
         deadline = time.monotonic() + budget
         identity = _EMPTY_ID if message_id is None else hashlib.sha256(str(message_id).encode("utf-8")).digest()
+        force_maintenance = False
         while True:
             try:
-                with self._region.locked(min(self.lock_timeout, max(0.0, deadline - time.monotonic()))) as abandoned:
-                    self._validate(abandoned)
+                with self._validated_lock(budget, maintain=True,
+                                          force_maintenance=force_maintenance, deadline=deadline):
                     consumers = self._subscribers()
                     previous = self._published_ids.get(identity) if identity != _EMPTY_ID else None
                     if previous is not None:
@@ -418,6 +532,13 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
                         # 有空余空间时保留历史即可；真正遇到容量边界才批量读取 ACK 并回收。
                         consumers = self._subscribers(refresh=True)
                         state = self._reclaim(lane, consumers)
+                        if (state.next_seq - state.head >= self.slot_counts[lane]
+                                or state.write_pos - state.reclaim_pos + len(payload) > self.capacities[lane]) and not force_maintenance:
+                            if budget and time.monotonic() >= deadline:
+                                raise PushBackpressureError("shared push lane full; unacknowledged messages retained")
+                            # 缓存中的消费者可能刚退出；释放元数据锁后沿同一截止强制探活一次。
+                            force_maintenance = True
+                            continue
                     if state.next_seq - state.head < self.slot_counts[lane] and state.write_pos - state.reclaim_pos + len(payload) <= self.capacities[lane]:
                         seq = state.next_seq
                         offset = self._index_offsets[lane] + (seq % self.slot_counts[lane]) * _RECORD.size
@@ -437,7 +558,7 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
                         self._published += 1
                         break
             except TransportTimeout as exc:
-                raise PushBackpressureError("shared push lock budget exhausted: %s" % exc)
+                raise PushLockBusyError("shared push lock budget exhausted: %s" % exc)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise PushBackpressureError("shared push lane full; unacknowledged messages retained")
@@ -466,17 +587,25 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
         self._open(max(0.0, deadline - time.monotonic()))
         try:
             while True:
-                with self._region.locked(min(self.lock_timeout, max(0.0, deadline - time.monotonic()))) as abandoned:
-                    header = self._header()
-                    if header.magic == _MAGIC and header.pid and process_alive(header.pid, header.birth):
-                        self._validate(abandoned)
+                with self._validated_lock(self.init_timeout, maintain=True, allow_missing=True,
+                                          deadline=deadline) as header:
+                    if header is not None:
                         self._epoch = header.epoch
                         consumers = self._maintain_consumers()
                         found = next(((slot, consumer) for slot, consumer in consumers if consumer.identity == self._identity and consumer.state), None)
                         if found is not None:
                             slot, consumer = found
                             if consumer.state == _EXPIRED:
-                                raise PushGapError("subscriber retention expired; explicit new subscription required")
+                                fresh_quote = (lane_mask == 1
+                                               and ((consumer.stable >> 1) & 3) == 1
+                                               and self._pending_topic_update == fingerprint
+                                               and consumer.token == self._topic_update_owner
+                                               and not consumer.stable & _CALLBACK_FAILED_FLAG)
+                                if not fresh_quote:
+                                    raise PushGapError("subscriber retention expired; explicit new subscription required")
+                                # 原持有者正常全部退订后主动新订阅，按新行情基线建立游标。
+                                # 交易日志、重建实例和回调失败仍不能丢弃旧游标或掩盖缺口。
+                                consumer = consumer._replace(market_cursor=self._lane(0).head - 1)
                             if consumer.state in (_ACTIVE, _FAILED):
                                 raise SharedMemoryPushError("subscriber_id is already active")
                             if consumer.topics != fingerprint:
@@ -508,13 +637,16 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
             self._running = self._started = True
             self._thread = threading.Thread(target=self._consume, args=(on_msg,), name="bigqmt-shm-push", daemon=True)
             self._thread.start()
-        except Exception:
+        except Exception as exc:
             self._running = False
             try:
                 self._release_consumer()
             finally:
                 self._close_handles()
                 self._started = False
+            if isinstance(exc, TransportTimeout) and time.monotonic() >= deadline:
+                # 两段锁共用启动截止，但对调用方仍保留原有的初始化超时错误语义。
+                raise SharedMemoryPushError("shared push publisher initialization timeout") from exc
             raise
 
     def _owned_consumer(self):
@@ -546,8 +678,7 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
             return True
         if not self._started or self.role != "client" or self._region is None:
             raise SharedMemoryPushError("shared push subscriber is not started")
-        with self._region.locked(self.lock_timeout) as abandoned:
-            self._validate(abandoned)
+        with self._validated_lock(self.lock_timeout):
             consumer = self._owned_consumer()
             self._write_consumer(self._slot, consumer._replace(topics=fingerprint))
             self._topics = selected
@@ -555,8 +686,7 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
 
     def _next_message(self, lane):
         """在锁内复制一条待确认消息；业务解码和回调在锁外执行。"""
-        with self._region.locked(self.lock_timeout) as abandoned:
-            self._validate(abandoned)
+        with self._validated_lock(self.lock_timeout):
             consumer = self._owned_consumer()
             if not ((consumer.stable >> 1) & (1 << lane)):
                 return None
@@ -570,8 +700,7 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
 
     def _ack(self, lane, seq):
         """仅在对应回调成功后推进一次确认，后续订阅实例可据此恢复。"""
-        with self._region.locked(self.lock_timeout) as abandoned:
-            self._validate(abandoned)
+        with self._validated_lock(self.lock_timeout):
             consumer = self._owned_consumer()
             cursor = consumer.market_cursor if lane == 0 else consumer.trade_cursor
             if cursor + 1 != seq:
@@ -645,8 +774,7 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
         if not self._started or self._region is None:
             raise SharedMemoryPushError("shared push channel is not started")
         try:
-            with self._region.locked(min(self.lock_timeout, 0.02)) as abandoned:
-                self._validate(abandoned)
+            with self._validated_lock(min(self.lock_timeout, 0.02)):
                 if self.role == "client":
                     self._owned_consumer()
                     if not self._running or self._thread is None or not self._thread.is_alive():
@@ -656,7 +784,7 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
                     if any(consumer.state == _FAILED or consumer.stable & _CALLBACK_FAILED_FLAG for consumer in consumers):
                         raise PushCallbackError("a shared push subscriber callback failed with unacknowledged messages")
         except TransportTimeout as exc:
-            raise PushBackpressureError("shared push health check lock busy: %s" % exc)
+            raise PushLockBusyError("shared push health check lock busy: %s" % exc)
         return self.status()
 
     def status(self):
@@ -691,13 +819,16 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
 
     def _close_handles(self):
         """关闭本实例拥有的映射和信号，不删除仍可能被其它进程使用的命名资源。"""
-        for signal in list(self._signals.values()) + [self._data_signal, self._space_signal]:
+        with self._signals_lock:
+            self._started = False
+            signals = list(self._signals.values())
+            self._signals.clear()
+        for signal in signals + [self._data_signal, self._space_signal]:
             if signal is not None:
                 try:
                     signal.close()
                 except Exception:
                     pass
-        self._signals.clear()
         self._data_signal = self._space_signal = None
         if self._region is not None:
             self._region.close()
