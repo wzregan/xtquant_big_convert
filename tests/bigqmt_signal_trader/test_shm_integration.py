@@ -654,14 +654,16 @@ def test_sdk_callback_failure_remains_visible_after_subscriber_stops(tmp_path):
             cleanup(name, str(tmp_path))
 
 
-def test_whole_quote_shm_supports_multiple_topics_and_explicit_resubscribe(tmp_path):
-    """真实稳定游标支持正常增删组合；全部退订后也能由用户显式订阅新组合。"""
+@pytest.mark.parametrize("retention_seconds", [0.0, 300.0])
+def test_whole_quote_shm_supports_multiple_topics_and_explicit_resubscribe(tmp_path, retention_seconds):
+    """真实稳定游标支持增删组合；正常全部退订后，过期身份也允许显式新订阅。"""
     from bigqmt_signal_trader.transports.shm_primitives import cleanup
 
     settings = {"namespace": str(tmp_path), "directory": str(tmp_path),
                 "market_push_bytes": 65536, "trade_push_bytes": 32768,
                 "market_push_slots": 16, "trade_push_slots": 8, "max_push_subscribers": 4,
-                "subscriber_id": "multi-quote-stable", "push_poll_seconds": 0.002}
+                "subscriber_id": "multi-quote-stable", "push_poll_seconds": 0.002,
+                "subscriber_retention_seconds": retention_seconds}
     backend = registry.get_backend("shm")
     server = backend.build_push_channel("server", {"shm": settings}, account_id="acct")
     client = backend.build_push_channel("client", {"shm": settings}, account_id="acct")
@@ -696,6 +698,9 @@ def test_whole_quote_shm_supports_multiple_topics_and_explicit_resubscribe(tmp_p
         wait_count(1, 2)
         assert len(received[0]) == 1
         session.unsubscribe_quote(second)
+        with server._region.locked(1):
+            # 零保留期稳定复现午间全部退订、稍后再次订阅时旧身份已成为过期墓碑。
+            server._maintain_consumers()
         third = session.subscribe_whole_quote(["512000.SH"], received[2].append)
         server.publish("512000.SH", {"price": 1.1})
         wait_count(2, 1)

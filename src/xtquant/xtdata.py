@@ -10,12 +10,15 @@ def _sdk_quote_callback(callback):
         """保留 Tick 结构；K 线时间缺失时从已规范化的上海时间索引补齐。"""
         payload = {}
         for code, value in data.items():
-            if not hasattr(value, "iterrows"):
+            if not hasattr(value, "itertuples"):
                 payload[code] = value
                 continue
             rows = []
-            for index, source in value.iterrows():
-                row = source.to_dict()
+            # 逐列保留 dtype，避免整行转为浮点后把大整数成交量与时间戳舍入。
+            columns = tuple(value.columns)
+            for source in value.itertuples(index=True, name=None):
+                index, values = source[0], source[1:]
+                row = dict(zip(columns, values))
                 if row.get("time") is None:
                     parsed = _compat._parse_qmt_stime(index)
                     if parsed is None:

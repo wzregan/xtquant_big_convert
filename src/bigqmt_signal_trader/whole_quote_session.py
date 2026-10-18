@@ -11,6 +11,7 @@ subscription does not by itself deliver an initial full snapshot — callers lay
 a ``get_full_tick`` prime on top (done in ``BigQmtXtData.subscribe_whole_quote``).
 """
 
+import logging
 import threading
 
 
@@ -41,6 +42,7 @@ class WholeQuoteClientSession(object):
         self._push_channel_used = False
         self._subscribed_topics = frozenset()  # topic set the subscriber covers now
         self._heartbeat_thread = None
+        self._heartbeat_stop = threading.Event()
         self._last_push_time = None  # monotonic time of last incoming push
         self._acknowledged_push = getattr(push_channel, "supports_acknowledgements", False) is True
         self._push_channel_factory = push_channel_factory
@@ -96,9 +98,13 @@ class WholeQuoteClientSession(object):
 
     # -- heartbeat -------------------------------------------------------------
     def start(self):
+        """启动唯一心跳线程；上一代尚未退出时禁止清除其停止信号。"""
         with self._lock:
             if self._started:
                 return
+            if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
+                raise RuntimeError("行情心跳线程尚未停止，不能重启")
+            self._heartbeat_stop.clear()
             self._started = True
             self._heartbeat_thread = threading.Thread(
                 target=self._heartbeat_loop, name="bigqmt-quote-keepalive", daemon=True
@@ -106,23 +112,40 @@ class WholeQuoteClientSession(object):
             self._heartbeat_thread.start()
 
     def stop(self):
+        """唤醒等待中的心跳并有限等待；超时保留线程句柄，不能报告已经回收。"""
         with self._lock:
             self._started = False
-        thread = self._heartbeat_thread
-        if thread is not None:
+            self._heartbeat_stop.set()
+            thread = self._heartbeat_thread
+        if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=1.0)
-        self._heartbeat_thread = None
+            if thread.is_alive():
+                raise RuntimeError("行情心跳线程未能在停止期限内退出")
+        with self._lock:
+            if thread is self._heartbeat_thread and (thread is None or not thread.is_alive()):
+                self._heartbeat_thread = None
 
     def close(self):
         """关闭本地推送和心跳；服务端注册由既有租约过期机制清理。"""
         with self._lock:
             self._subscriptions.clear()
-            self._sync_subscriber_locked()
-        self.stop()
+            channel = self._channel if self._push_channel_used else None
+            self._subscriber_active = False
+            self._subscribed_topics = frozenset()
+        # 推送回调也需要会话锁，不能在持锁时等待其线程退出。
+        # 即使退订已经请求过停止，最终关闭仍重试回收，不把超时当作成功。
+        try:
+            self.stop()
+        finally:
+            if channel is not None:
+                try:
+                    channel.stop()
+                except Exception:
+                    if self._acknowledged_push:
+                        raise
 
     def _heartbeat_loop(self):
-        import time
-
+        """定期续租及重放订阅，暂时恢复失败时保留重试，不结束心跳线程。"""
         consecutive_failures = 0
         silence_rounds = 0
         prev_last_push = None
@@ -133,13 +156,15 @@ class WholeQuoteClientSession(object):
                 sub_ids = list(self._subscriptions.keys())
                 last_push = self._last_push_time
             if self._acknowledged_push and not self._check_push_health():
-                time.sleep(self._heartbeat_interval)
+                self._heartbeat_stop.wait(self._heartbeat_interval)
                 continue
             if not sub_ids:
-                time.sleep(self._heartbeat_interval)
+                self._heartbeat_stop.wait(self._heartbeat_interval)
                 continue
             failures = 0
             for sub_id in sub_ids:
+                if self._heartbeat_stop.is_set():
+                    return
                 try:
                     self._rpc("quote_keepalive", {"client_id": self.client_id, "sub_id": sub_id})
                 except Exception:
@@ -150,8 +175,8 @@ class WholeQuoteClientSession(object):
                 # Server is back after a restart window: replay subscriptions so
                 # the restarted server re-creates the big-QMT subscriptions (its
                 # state is gone). Idempotent on the server, so replays are safe.
-                self.replay_subscriptions()
-                consecutive_failures = 0
+                if self._replay_for_heartbeat():
+                    consecutive_failures = 0
             else:
                 consecutive_failures = 0
             # Push-silence detection: a server restart can survive with keepalive
@@ -165,9 +190,18 @@ class WholeQuoteClientSession(object):
                 silence_rounds += 1
             prev_last_push = last_push
             if silence_rounds >= self._push_silence_replay_heartbeats:
-                self.replay_subscriptions()
-                silence_rounds = 0
-            time.sleep(self._heartbeat_interval)
+                if self._replay_for_heartbeat():
+                    silence_rounds = 0
+            self._heartbeat_stop.wait(self._heartbeat_interval)
+
+    def _replay_for_heartbeat(self):
+        """重放暂时失败时保留重试计数，不能让整个心跳线程退出并失去全部订阅。"""
+        try:
+            self.replay_subscriptions()
+            return True
+        except Exception:
+            logging.getLogger(__name__).debug("行情订阅重放失败，下轮心跳重试", exc_info=True)
+            return False
 
     # -- push routing ------------------------------------------------------------
     def _on_push(self, topic, data):
@@ -258,12 +292,12 @@ class WholeQuoteClientSession(object):
         if active == self._subscribed_topics:
             return
         if not active:
-            if self._subscriber_active:
-                try:
-                    self._channel.stop()
-                except Exception:
-                    pass
-                self._subscriber_active = False
+            # 空集合相等已在上面返回；到这里必然是最后一个主题退出，直接幂等关闭。
+            try:
+                self._channel.stop()
+            except Exception:
+                pass
+            self._subscriber_active = False
             self._subscribed_topics = active
             return
         update_topics = getattr(self._channel, "update_topics", None)

@@ -1384,7 +1384,13 @@ class _BarPoller(object):
         return self
 
     def stop(self):
+        """唤醒轮询并等待其退出；原生查询未返回时保留线程句柄并明确报告失败。"""
         self._stop.set()
+        thread = self._thread
+        if thread is not threading.current_thread() and thread.is_alive():
+            thread.join(1.0)
+            if thread.is_alive():
+                raise RuntimeError("BigQMT bar poller did not stop")
 
     @staticmethod
     def _signature(data):
@@ -1397,9 +1403,11 @@ class _BarPoller(object):
                     if getattr(value, "empty", True):
                         continue
                     # 当前分钟可能完全未变，不能只比较最后一行而吞掉上一分钟修订。
+                    # iterrows 会把浮点价格和整数数量合成浮点行，吞掉超过 2**53 的单份变化。
+                    columns = tuple(str(key) for key in value.columns)
                     return (int(len(value)), tuple(
-                        (str(index), tuple((str(key), repr(item)) for key, item in row.items()))
-                        for index, row in value.tail(2).iterrows()
+                        (str(row[0]), tuple(zip(columns, (repr(item) for item in row[1:]))))
+                        for row in value.tail(2).itertuples(index=True, name=None)
                     ))
                 if isinstance(value, (list, tuple)) and value:
                     return repr(value[-2:]), len(value)
@@ -2387,13 +2395,14 @@ class BigQmtXtData:
         return sub_id
 
     def unsubscribe_quote(self, seq):
-        # Three kinds of handle now: whole-quote / tick subscriptions owned by
-        # the push session, K-line pollers owned here, and legacy seqs that only
-        # ever existed as redis bookkeeping.
+        """停止指定订阅；原生轮询尚未退出时保留所有权，允许调用方再次清理。"""
         with self._bar_poller_lock:
-            poller = self._bar_pollers.pop(seq, None)
+            poller = self._bar_pollers.get(seq)
         if poller is not None:
             poller.stop()
+            with self._bar_poller_lock:
+                if self._bar_pollers.get(seq) is poller:
+                    self._bar_pollers.pop(seq)
             self._record_subscription(seq, {}, active=False)
             return 0
 
@@ -2407,14 +2416,21 @@ class BigQmtXtData:
         return 0
 
     def stop_all_subscriptions(self):
-        """Stop every K-line poller this object owns. Daemon threads die with
-        the process anyway; this is for tests and for callers that recycle a
-        client without exiting."""
+        """停止所有所属 K 线线程；逐个清理并保留未退出句柄，不隐瞒残留消费者。"""
         with self._bar_poller_lock:
-            pollers = list(self._bar_pollers.values())
-            self._bar_pollers.clear()
-        for poller in pollers:
-            poller.stop()
+            pollers = list(self._bar_pollers.items())
+        failures = []
+        for seq, poller in pollers:
+            try:
+                poller.stop()
+            except Exception as error:
+                failures.append(error)
+                continue
+            with self._bar_poller_lock:
+                if self._bar_pollers.get(seq) is poller:
+                    self._bar_pollers.pop(seq)
+        if failures:
+            raise RuntimeError("BigQMT bar subscriptions did not stop: %s" % failures[0])
         return len(pollers)
 
     def run(self):

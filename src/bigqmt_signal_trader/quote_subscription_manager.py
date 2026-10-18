@@ -226,29 +226,27 @@ class QuoteSubscriptionManager(object):
         self._close_source(handle_to_close)
 
     def keepalive(self, client_id, sub_id):
-        """Refresh last_seen for (client_id, sub_id). Unknown sub_ids are a no-op."""
+        """仅刷新仍有效订阅的租约；索引读取与更新原子执行，避免退订后被旧心跳复活。"""
         client_id = str(client_id or "")
-        key = self._sub_index.get((client_id, str(sub_id or "")))
-        if key is None:
-            return
         with self._lock:
-            combo = self._combos.get(key)
-            if combo is None:
+            key = self._sub_index.get((client_id, str(sub_id or "")))
+            if key is None:
                 return
+            combo = self._combos[key]
             combo.clients[(client_id, str(sub_id or ""))] = self._now()
 
     # -- reaper ---------------------------------------------------------------
     def reap_expired(self, now=None):
-        """Remove subscriptions silent for longer than the keepalive timeout;
-        tear down combos that end up empty. Returns the number reaped."""
+        """清理租约过期订阅并归还已无订阅者的原生句柄，返回清理数量。
+
+        now 为同一单调时钟的秒数；省略时读取配置的时钟。
+        """
         now = self._now() if now is None else now
         reaped = 0
         handles_to_close = []
         with self._lock:
-            for key in list(self._combos.keys()):
-                combo = self._combos.get(key)
-                if combo is None:
-                    continue
+            # 持锁期间仅本循环删除组合；每个组合只遍历一次，无需再次查找已取得的对象。
+            for key, combo in list(self._combos.items()):
                 for (client_id, sub_id), last_seen in list(combo.clients.items()):
                     if now - last_seen > self._heartbeat_timeout:
                         self._sub_index.pop((client_id, sub_id), None)
