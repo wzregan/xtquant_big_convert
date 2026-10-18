@@ -111,6 +111,8 @@ class SharedMemoryTransport(RpcTransport):
         self._space_signal = None
         self._reply_signals = {}
         self._response_blobs = {}
+        # 同一槽的重复回调必须串行；不同槽的大响应不能互相耗尽提交等待预算。
+        self._response_locks = [threading.Lock() for _ in range(self.rpc_slots)]
         self._init_lock = threading.RLock()
         self._lifecycle = threading.Condition(threading.RLock())
         self._active = 0
@@ -123,7 +125,8 @@ class SharedMemoryTransport(RpcTransport):
         self._drain_contended = False
         self.defer_execution = False
         self._stats = {"published": 0, "executed": 0, "responses": 0,
-                       "timeouts": 0, "late_responses": 0, "signal_errors": 0, "lock_contentions": 0}
+                       "timeouts": 0, "late_responses": 0, "signal_errors": 0, "lock_contentions": 0,
+                       "execution_lock_retries": 0, "response_lock_retries": 0}
 
     @contextlib.contextmanager
     def _operation(self, deadline=None):
@@ -393,7 +396,10 @@ class SharedMemoryTransport(RpcTransport):
                 finally:
                     if blob is not None:
                         self._drop_blob(blob, token, "request")
-        except SharedMemoryTimeout:
+        except SharedMemoryTimeout as exc:
+            # 深层报文复制只知道槽令牌；在公开边界补回业务编号，便于核对不确定结果。
+            if not exc.request_id:
+                exc.request_id = request_id
             self._stats["timeouts"] += 1
             raise
         except TransportTimeout:
@@ -476,6 +482,8 @@ class SharedMemoryTransport(RpcTransport):
                 try:
                     self._thread.start()
                 except BaseException:
+                    # 启动失败的线程不可 join，否则清理异常会掩盖真正原因。
+                    self._thread = None
                     self.stop()
                     raise
 
@@ -542,7 +550,7 @@ class SharedMemoryTransport(RpcTransport):
                     self._stats["lock_contentions"] += 1
                     break
                 if payload_error is not None:
-                    request = {"_shm_route": {"index": index, "token": value[1].hex(), "epoch": self._epoch.hex()}}
+                    request = {"_shm_route": {"index": index, "token": value[1].hex(), "epoch": self._epoch.hex(), "deadline": value[4]}}
                     self.send_response(request, {"ok": False, "error": str(payload_error),
                                                  "error_code": "SHM_REQUEST_CORRUPT", "outcome_unknown": False})
                     processed += 1
@@ -552,12 +560,12 @@ class SharedMemoryTransport(RpcTransport):
                     if not isinstance(request, dict):
                         raise ValueError("SHM request must be an object")
                 except (ValueError, UnicodeError) as exc:
-                    request = {"_shm_route": {"index": index, "token": value[1].hex(), "epoch": self._epoch.hex()}}
+                    request = {"_shm_route": {"index": index, "token": value[1].hex(), "epoch": self._epoch.hex(), "deadline": value[4]}}
                     self.send_response(request, {"ok": False, "error": str(exc),
                                                  "error_code": "SHM_REQUEST_CORRUPT", "outcome_unknown": False})
                     processed += 1
                     continue
-                request["_shm_route"] = {"index": index, "token": value[1].hex(), "epoch": self._epoch.hex()}
+                request["_shm_route"] = {"index": index, "token": value[1].hex(), "epoch": self._epoch.hex(), "deadline": value[4]}
                 if self.defer_execution or self.begin_request(request):
                     self.deliver(request)
                 processed += 1
@@ -566,10 +574,28 @@ class SharedMemoryTransport(RpcTransport):
     def begin_request(self, request):
         """真正执行前原子校验；本地排队超时的请求不会迟到执行。"""
         try:
-            return self._begin_request(request)
+            return self._retry_transition_lock(
+                request, lambda: self._begin_request(request), "execution_lock_retries")
         except TransportTimeout:
-            # 瞬时争锁失败只拒绝本请求执行，不能停掉整个接收线程；客户端超时会核查槽状态。
+            # 有界争锁仍失败时拒绝执行；不能杀掉接收线程，也不能重报业务请求。
             return False
+
+    def _retry_transition_lock(self, request, action, counter):
+        """最多约百毫秒重查同一状态转换；action 只能含门禁或既有响应提交，不能执行业务。"""
+        deadline = time.monotonic() + 0.1
+        request_deadline = (request.get("_shm_route") or {}).get("deadline")
+        if isinstance(request_deadline, (int, float)) and math.isfinite(request_deadline):
+            deadline = min(deadline, request_deadline)
+        while True:
+            try:
+                return action()
+            except TransportTimeout as exc:
+                # 数据复制超时已有业务语义，不能把它当成单纯互斥争用重新提交。
+                remaining = deadline - time.monotonic()
+                if isinstance(exc, SharedMemoryTimeout) or self._closed or remaining <= 0:
+                    raise
+                self._stats[counter] += 1
+                time.sleep(min(0.001, remaining))
 
     @contextlib.contextmanager
     def execution_scope(self, request):
@@ -625,32 +651,60 @@ class SharedMemoryTransport(RpcTransport):
         if not 0 <= index < self.rpc_slots:
             return False
         token = bytes.fromhex(route["token"])
-        external, checksum, blob = len(payload) > self.rpc_slot_bytes, _crc(payload), None
         with self._operation():
-            try:
-                if external:
-                    blob = self._create_blob(token, "response", payload, checksum,
-                                             time.monotonic() + self.wait_poll_seconds)
-                with self._locked(self.wait_poll_seconds):
-                    ready, _, _, epoch = self._read_header()
-                    value = self._read_slot(index)
-                    if (not ready or epoch != self._epoch or value is None or value[1] != token
-                            or value[0] not in (_CLAIMED, _EXECUTING) or value[4] <= time.monotonic()):
-                        self._stats["late_responses"] += 1
-                        return False
-                    if blob is not None:
-                        self._response_blobs[token] = (index, blob)
-                    value = (_RESPONSE,) + value[1:6] + (len(payload) | (_EXTERNAL if external else 0), checksum)
-                    self._write_slot(index, value, None if external else payload)
-                    blob = None
-                    self._stats["responses"] += 1
-                hint = self._reply_hint(index)
-                if hint is not None:
-                    self._signal(hint)
-                return True
-            finally:
+            # 原生调用已完成，短暂争锁只能延后同一响应，不能丢弃响应或重执行处理器。
+            return self._retry_transition_lock(
+                request, lambda: self._publish_response_payload(index, token, payload),
+                "response_lock_retries")
+
+    def _publish_response_payload(self, index, token, payload):
+        """串行提交同槽既有响应，每次重查仍验证代次、令牌、截止时间及首次响应所有权。"""
+        response_lock = self._response_locks[index]
+        if not response_lock.acquire(timeout=self.wait_poll_seconds):
+            raise TransportTimeout("SHM response publication lock timed out")
+        try:
+            return self._commit_response(index, token, payload)
+        finally:
+            response_lock.release()
+
+    def _response_slot(self, index, token):
+        """在主区域锁内核对响应所有权，重复、过期或换代回调都不能改动 blob。"""
+        ready, _, _, epoch = self._read_header()
+        value = self._read_slot(index)
+        if (not ready or epoch != self._epoch or value is None or value[1] != token
+                or value[0] not in (_CLAIMED, _EXECUTING) or value[4] <= time.monotonic()):
+            self._stats["late_responses"] += 1
+            return None
+        return value
+
+    def _commit_response(self, index, token, payload):
+        """串行核对并提交响应；分配大映射前后都检查槽，避免重复回调覆盖首次结果。"""
+        external, checksum, blob = len(payload) > self.rpc_slot_bytes, _crc(payload), None
+        try:
+            # 大报文映射按令牌命名，分配前必须拒绝已提交响应；否则会覆写其内容。
+            with self._locked(self.wait_poll_seconds):
+                if self._response_slot(index, token) is None:
+                    return False
+            if external:
+                blob = self._create_blob(token, "response", payload, checksum,
+                                         time.monotonic() + self.wait_poll_seconds)
+            with self._locked(self.wait_poll_seconds):
+                value = self._response_slot(index, token)
+                if value is None:
+                    return False
                 if blob is not None:
-                    self._drop_blob(blob, token, "response")
+                    self._response_blobs[token] = (index, blob)
+                value = (_RESPONSE,) + value[1:6] + (len(payload) | (_EXTERNAL if external else 0), checksum)
+                self._write_slot(index, value, None if external else payload)
+                blob = None
+                self._stats["responses"] += 1
+            hint = self._reply_hint(index)
+            if hint is not None:
+                self._signal(hint)
+            return True
+        finally:
+            if blob is not None:
+                self._drop_blob(blob, token, "response")
 
     def _reap_blobs(self):
         """客户端 ACK 或超时后回收大响应，保留数量受并发槽位限制。"""

@@ -174,6 +174,9 @@ def _take_flock(fd, deadline):
             return True
         except OSError as exc:
             if exc.errno == errno.EINTR:
+                # 连续信号中断也消耗同一个超时预算，不能绕过下面的竞争等待检查。
+                if time.monotonic() >= deadline:
+                    return False
                 continue
             if exc.errno not in (errno.EACCES, errno.EAGAIN):
                 raise TransportError("shared-memory lock failed: %s" % exc)

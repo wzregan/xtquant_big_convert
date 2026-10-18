@@ -97,6 +97,9 @@ def copy_backend_config(config, memo=None):
         return result
     if isinstance(config, tuple):
         result = tuple(copy_backend_config(value, memo) for value in config)
+        # 元组可经可变容器回指自身；递归期间可能已创建该元组，必须沿用其身份。
+        if identity in memo:
+            return memo[identity]
         memo[identity] = result
         return result
     return config
@@ -160,9 +163,11 @@ def zmq_push_address(role, config=None, account_id=""):
         address = str(rpc_address)
         if not address.startswith("tcp://"):
             raise ValueError("non-TCP RPC requires an explicit quote_push_" + suffix)
-        host_prefix, separator, port = address.rpartition(":")
-        if not separator:
+        # 只拆协议之后的地址，避免把 tcp: 自身的冒号误当成端口分隔符。
+        host, separator, port = address[len("tcp://"):].rpartition(":")
+        if not separator or not host or not port:
             raise ValueError("invalid RPC endpoint: %s" % address)
+        host_prefix = "tcp://" + host
         base_port = int(port)
     else:
         host = settings.get("host") or ("0.0.0.0" if role == "server" else DEFAULT_ZMQ_HOST)
