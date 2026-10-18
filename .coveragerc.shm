@@ -1,0 +1,15 @@
+[run]
+branch = True
+parallel = True
+concurrency = thread,multiprocessing
+source =
+    bigqmt_signal_trader.transports.shm_primitives
+    bigqmt_signal_trader.transports.shm_transport
+    bigqmt_signal_trader.shm_push_channel
+    bigqmt_signal_trader.transports.backend
+    bigqmt_signal_trader.quote_subscription_manager
+    bigqmt_signal_trader.whole_quote_session
+
+[report]
+precision = 2
+show_missing = True
