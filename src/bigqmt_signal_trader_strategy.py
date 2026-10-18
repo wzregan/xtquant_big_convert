@@ -853,19 +853,68 @@ def _install_acknowledged_push_gate(handlers, channel):
                     "sticky_error": "acknowledged push is disabled"}
         return channel.status()
 
+    def checked_health():
+        """统一 ping 与报单的真实健康判定；只在原生执行前有界重查短暂锁忙。"""
+        state = health()
+        if channel is None:
+            return state
+        deadline = time.monotonic() + 0.1
+        hard_reasons = ("closed", "sticky_error", "capacity_backpressure", "queue_high_water")
+        while True:
+            if any(state.get(key) for key in hard_reasons):
+                return state
+            try:
+                # ping 也会被 SDK 缓存为交易门禁，不能把后台一瞬间的争锁快照放大数秒。
+                # 不持有 publisher 的本地锁等待；发送线程必须能够独立提交原队首。
+                channel.check_health()
+            except Exception as exc:
+                state = health()
+                remaining = deadline - time.monotonic()
+                if any(state.get(key) for key in hard_reasons):
+                    return state
+                if not getattr(exc, "retryable", False) or remaining <= 0:
+                    state = dict(state)
+                    state.update(healthy=False, new_orders_blocked=True,
+                                 last_error="%s: %s" % (type(exc).__name__, exc))
+                    return state
+                time.sleep(min(0.002, remaining))
+                continue
+            state = health()
+            if not state.get("new_orders_blocked"):
+                return state
+            remaining = deadline - time.monotonic()
+            lock_busy_only = (
+                (state.get("health_check_busy") or state.get("publish_lock_busy"))
+                and not any(state.get(key) for key in hard_reasons)
+            )
+            if not lock_busy_only or remaining <= 0:
+                return state
+            # 发布锁忙只能由队首实际提交解除，等待期间不与发送者反复争抢共享锁。
+            while True:
+                time.sleep(min(0.002, remaining))
+                next_state = health()
+                if any(next_state.get(key) for key in hard_reasons):
+                    return next_state
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    # 保留上次已知阻断状态；提交完成也不能绕过超时后的最终健康核验。
+                    return state
+                state = next_state
+                if not state.get("publish_lock_busy"):
+                    break
+
     def guarded_handle(method, params=None):
         """原权限及业务算法保持原样，仅在新报单之前检查通信状态。"""
         canonical = handlers._canonical_method(str(method or "").strip())
         if canonical in ("submit_order", "submit_orders_batch", "passorder"):
-            state = health()
+            state = checked_health()
             if state.get("new_orders_blocked"):
-                # 门禁在原生报单前拒绝；明确声明未执行，避免账本将其误记为 UNKNOWN。
                 raise ExecutionRejected("acknowledged push is unhealthy; new orders blocked: %s"
                                         % (state.get("sticky_error") or state.get("last_error") or "backlog"))
         result = original_handle(method, params)
         if canonical == "ping" and isinstance(result, dict):
             result = dict(result)
-            result["communication_health"] = health()
+            result["communication_health"] = checked_health()
         return result
 
     handlers.handle = guarded_handle

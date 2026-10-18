@@ -49,6 +49,8 @@ class XtQuantTrader(BigQmtXtTrader):
             if str(pong.get("account_id") or "") != str(self.client.account_id or ""):
                 raise ConnectionError("BigQMT account_id mismatch")
             self._note_server_account_type(pong)
+            # 标准 SDK 覆盖了父类 connect，必须同步保存门禁，不能等待后台首次探测。
+            self._note_communication_health(pong)
             self._sdk_capabilities = frozenset(pong.get("sdk_capabilities") or ())
             if "account_status_v1" not in self._sdk_capabilities:
                 raise ConnectionError("bridge requires account_status_v1")

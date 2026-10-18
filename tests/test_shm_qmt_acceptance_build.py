@@ -528,7 +528,7 @@ try:
             error_type = load("bigqmt_signal_trader.transports.base").TransportError
             publisher._channel.check_health = Mock(side_effect=error_type("injected offline channel fault"))
             namespace["adjust"](context)
-            assert publisher.status()["new_orders_blocked"] is True
+            # 后台 flush 只发唤醒；立即继续报单以验证门禁独立于 sender 健康缓存更新。
             fault_applied.set()
         time.sleep(0.001)
     assert done.is_set(), "formal SDK trading workflow did not finish within deadline"

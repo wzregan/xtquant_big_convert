@@ -218,6 +218,27 @@ def test_gate_keeps_original_queries_and_cancels_available_during_backpressure()
     assert original.call_count == 3
 
 
+@pytest.mark.parametrize("method", ("submit_order", "submit_orders_batch", "passorder"))
+@pytest.mark.parametrize("fault", (TransportError("corrupt header"), Backpressure("health lock busy")))
+def test_gate_rechecks_channel_when_background_health_snapshot_is_stale(method, fault):
+    """后台检查尚未更新缓存时，新单仍须检查实际通道；故障不能进入原生报单。"""
+    channel = RecordingChannel()
+    publisher = BufferedAcknowledgedPublisher(channel)
+    original = Mock(return_value={"submitted": True})
+    handlers = SimpleNamespace(handle=original, _canonical_method=lambda value: value)
+    strategy._install_acknowledged_push_gate(handlers, publisher)
+    # 确定性重现 sender 被调度之前的窗口，不能调用 flush 提前替门禁发现故障。
+    channel.health_error = fault
+    assert publisher.status()["new_orders_blocked"] is False
+    with pytest.raises(ExecutionRejected, match="new orders blocked") as rejected:
+        handlers.handle(method)
+    assert rejected.value.error_code == "EXECUTION_NOT_STARTED"
+    original.assert_not_called()
+    assert handlers.handle("cancel_order") == {"submitted": True}
+    assert handlers.handle("query_stock_orders") == {"submitted": True}
+    assert original.call_count == 2
+
+
 def test_real_native_trade_callback_is_queued_then_flushed_on_strategy_thread(monkeypatch):
     """真实成交归一化入口不等待共享日志，策略回调负责有界提交。"""
     channel = RecordingChannel()
@@ -454,7 +475,7 @@ def test_execution_health_lock_busy_does_not_disconnect_or_rebuild(acknowledged_
         if len(sleeps) == 2:
             trader._event_running = False
 
-    monkeypatch.setattr(xtquant_compat.time, "sleep", advance)
+    monkeypatch.setattr(trader._event_stop, "wait", advance)
     try:
         trader._event_loop_push_channel()
         callback.on_disconnected.assert_not_called()
@@ -603,7 +624,7 @@ def test_sdk_callback_failure_remains_visible_after_subscriber_stops(tmp_path):
                 "subscriber_id": "callback-failure-stable", "push_poll_seconds": 0.002}
     backend = registry.get_backend("shm")
     raw = backend.build_push_channel("server", {"shm": settings}, account_id="acct")
-    wrapper = BufferedAcknowledgedPublisher(raw)
+    wrapper = BufferedAcknowledgedPublisher(raw, {"push_background_sender": False})
     trader = BigQmtXtTrader(account_id="acct", redis_config={"transport": "shm", "shm": settings,
                                                             "redis_enabled": False})
     trader.register_callback(SimpleNamespace(on_stock_trade=Mock(side_effect=RuntimeError("user failed"))))
@@ -941,3 +962,109 @@ def test_legacy_service_success_with_diagnostic_keeps_old_response_semantics():
     assert response["ok"] is True
     assert response["server_error"] == "legacy diagnostic"
     assert "outcome_unknown" not in response
+
+
+@pytest.mark.parametrize("background", [False, True])
+def test_sender_progresses_without_qmt_timer_and_preserves_fifo(background):
+    """慢查询占用 QMT 回调期间后台仍提交，手动模式则积压；消费顺序不得改变。"""
+    channel = RecordingChannel()
+    publisher = BufferedAcknowledgedPublisher(channel, {"push_background_sender": background})
+    publisher.start_publisher()
+    try:
+        for index in range(200):
+            publisher.publish("quotes", {"sequence": index})
+        deadline = time.monotonic() + 1.0
+        while background and len(channel.committed) < 200 and time.monotonic() < deadline:
+            time.sleep(0.002)
+        if background:
+            assert [item[1]["sequence"] for item in channel.committed] == list(range(200))
+            assert len({item[0] for item in channel.attempts}) == 200
+            assert publisher.status()["sender_alive"] is True
+        else:
+            assert channel.committed == []
+            assert publisher.status()["local_pending"]["quote"] == 200
+            assert publisher.flush(max_items=200, max_wall_seconds=1) == 200
+        assert publisher.status()["new_orders_blocked"] is False
+    finally:
+        publisher.stop()
+    assert publisher.status()["sender_alive"] is False
+
+
+def test_background_backpressure_retries_same_message_and_keeps_exec_priority():
+    """后台背压可恢复，但不重复提交；恢复后交易回报优先且队首编号不变。"""
+    channel = RecordingChannel()
+    channel.error = Backpressure("busy")
+    publisher = BufferedAcknowledgedPublisher(channel)
+    publisher.publish("exec:trade", {"sequence": 1})
+    publisher.publish("quotes", {"sequence": 2})
+    publisher.start_publisher()
+    try:
+        deadline = time.monotonic() + 1
+        while not channel.attempts and time.monotonic() < deadline:
+            time.sleep(.002)
+        assert publisher.status()["backpressure_count"] > 0
+        assert publisher.status()["new_orders_blocked"] is True
+        for _ in range(20):
+            assert publisher.flush() == 0
+        channel.error = None
+        deadline = time.monotonic() + 1
+        while len(channel.committed) < 2 and time.monotonic() < deadline:
+            time.sleep(.002)
+        assert channel.committed == [("exec:trade", {"sequence": 1}), ("quotes", {"sequence": 2})]
+        assert len({item[0] for item in channel.attempts[:-1]}) == 1
+        assert publisher.status()["new_orders_blocked"] is False
+    finally:
+        publisher.stop()
+
+
+def test_background_stop_retains_mapping_while_publish_is_inflight():
+    """发送线程尚未退出时不得关闭映射；发送完成后允许再次安全回收。"""
+    channel = RecordingChannel()
+    entered, release = threading.Event(), threading.Event()
+    original = channel.publish
+
+    def blocked(*args, **kwargs):
+        """模拟系统调用停滞，直到测试明确释放。"""
+        entered.set()
+        assert release.wait(5)
+        return original(*args, **kwargs)
+
+    channel.publish = blocked
+    publisher = BufferedAcknowledgedPublisher(channel)
+    publisher.start_publisher()
+    publisher.publish("exec:trade", {"sequence": 1})
+    try:
+        assert entered.wait(1)
+        with pytest.raises(TransportError, match="resources retained"):
+            publisher.stop()
+        assert channel.stopped == 0
+    finally:
+        release.set()
+        publisher.stop()
+    assert channel.stopped == 1
+    assert publisher.status()["shared_committed"] == 1
+
+
+def test_bridge_health_cache_expires_and_keeps_sticky_gate(acknowledged_backend, monkeypatch):
+    """本地缓存读不调用 RPC，过期或服务端故障保守关门，恢复以新探测为准。"""
+    trader = BigQmtXtTrader(account_id="acct", redis_config={"transport": "ack_integration_test"})
+    trader.client.call = Mock(return_value={"communication_health": {
+        "healthy": True, "new_orders_blocked": False}})
+    now = [100.0]
+    monkeypatch.setattr(xtquant_compat.time, "monotonic", lambda: now[0])
+    assert trader.communication_health["new_orders_blocked"] is True
+    trader._probe_communication_health()
+    assert trader.communication_health["healthy"] is True
+    trader._probe_communication_health()
+    assert trader.client.call.call_count == 1
+    now[0] += 11
+    assert trader.communication_health["new_orders_blocked"] is True
+    trader.client.call.return_value = {"communication_health": {
+        "healthy": False, "new_orders_blocked": True, "sticky_error": "queue is full"}}
+    trader._probe_communication_health()
+    assert trader.communication_health["sticky_error"] == "queue is full"
+    now[0] += 3
+    trader.client.call.side_effect = TimeoutError("busy")
+    trader._probe_communication_health()
+    assert trader.communication_health["new_orders_blocked"] is True
+    assert "probe failed" in trader.communication_health["last_error"]

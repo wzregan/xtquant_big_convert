@@ -3046,8 +3046,13 @@ class BigQmtXtTrader:
         self.callback = None
         self._event_thread = None
         self._event_running = False
+        self._event_stop = threading.Event()
         self._push_listener_error = ""
         self._push_callback_failed = False
+        self._communication_health_lock = threading.Lock()
+        self._communication_health = None
+        self._communication_health_at = 0.0
+        self._next_communication_probe = 0.0
         # Async order submission (issue #50). One worker, started on first use,
         # so a client that never calls order_stock_async pays nothing.
         self._async_order_queue = _queue.Queue()
@@ -3117,14 +3122,55 @@ class BigQmtXtTrader:
         return 0
 
     def connect(self):
+        """连接桥接并读取通信门禁；账户在线不能代替可靠推送健康。"""
         if self.client.account_id:
             pong = self.client.call("ping")
+            self._note_communication_health(pong)
             self._note_server_account_type(pong)
             mismatch = warn_on_version_mismatch(pong)
             if mismatch and auto_sync_enabled():
                 self.sync_deployment()
         self._fire_account_status()
         return 0
+
+    @property
+    def communication_health(self):
+        """返回最近桥接健康缓存，不发起 RPC；十秒未刷新时保守阻断新报单。"""
+        if not getattr(_client_backend(self.client), "acknowledged_push", False):
+            return None
+        with self._communication_health_lock:
+            result = dict(self._communication_health or {})
+            age = time.monotonic() - self._communication_health_at
+        if not result or age > 10.0:
+            result.update(healthy=False, new_orders_blocked=True,
+                          last_error="bridge communication health unavailable or expired")
+        return result
+
+    def _note_communication_health(self, pong):
+        """保存服务端通信状态，可靠后端缺少诊断字段时不能假报就绪。"""
+        if not getattr(_client_backend(self.client), "acknowledged_push", False):
+            return
+        state = pong.get("communication_health") if isinstance(pong, dict) else None
+        if not isinstance(state, dict):
+            state = {"healthy": False, "new_orders_blocked": True,
+                     "last_error": "bridge ping omitted communication_health"}
+        with self._communication_health_lock:
+            self._communication_health = dict(state)
+            self._communication_health_at = time.monotonic()
+
+    def _probe_communication_health(self):
+        """每三秒最多一次只读探测；失败只关通信门禁，不重建正常的交易回报通道。"""
+        now = time.monotonic()
+        if now < self._next_communication_probe:
+            return
+        self._next_communication_probe = now + 3.0
+        try:
+            self._note_communication_health(self.client.call("ping", timeout_seconds=1.0))
+        except Exception as exc:
+            self._note_communication_health({"communication_health": {
+                "healthy": False, "new_orders_blocked": True,
+                "last_error": "bridge health probe failed: %s: %s" % (type(exc).__name__, exc),
+            }})
 
     def sync_deployment(self, dry_run=False):
         """Push this client's package into the QMT python directory.
@@ -3184,9 +3230,11 @@ class BigQmtXtTrader:
         # Costs nothing when the queue is empty (issue #156).
         self._drain_async_orders_on_exit()
         deadline = time.monotonic() + 1.0
+        self._event_running = False
+        # 断连回调会立即要求上层停止；必须唤醒重连退避，避免其耗尽同一秒停止预算。
+        self._event_stop.set()
         self._cancel_worker.close(timeout=max(0.0, deadline - time.monotonic()))
         self._request_worker.close(timeout=max(0.0, deadline - time.monotonic()))
-        self._event_running = False
         thread = self._event_thread
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
             thread.join(max(0.0, deadline - time.monotonic()))
@@ -3195,6 +3243,7 @@ class BigQmtXtTrader:
     def _start_event_listener(self):
         if self._event_thread is not None and self._event_thread.is_alive():
             return
+        self._event_stop.clear()
         self._event_running = True
         # 显式再次启动是用户处理故障后的恢复动作，后台循环不能自行重复副作用回调。
         self._push_callback_failed = False
@@ -3273,15 +3322,16 @@ class BigQmtXtTrader:
                 if str(self.client.account_id or "") != account_id:
                     return       # account changed -> rebuild against the new address
                 if getattr(channel, "supports_acknowledgements", False) is True:
+                    self._probe_communication_health()
                     try:
                         channel.check_health()
                     except Exception as health_error:
                         if not getattr(health_error, "retryable", False):
                             raise
                         # 共享元数据锁短暂繁忙不等于断连，不重建或重复回调。
-                        time.sleep(0.5)
+                        self._event_stop.wait(0.5)
                         continue
-                time.sleep(0.5)
+                self._event_stop.wait(0.5)
         except Exception as exc:
             if channel is not None and getattr(channel, "supports_acknowledgements", False) is True:
                 self._push_listener_error = "%s: %s" % (type(exc).__name__, exc)
@@ -3298,7 +3348,7 @@ class BigQmtXtTrader:
                 log.exception("执行事件回调失败，已停止自动重放，需显式核对后重启订阅")
             else:
                 log.exception("执行事件推送通道异常，将在一秒后重试")
-                time.sleep(1.0)
+                self._event_stop.wait(1.0)
         finally:
             if channel is not None:
                 try:
