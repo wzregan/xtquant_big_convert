@@ -195,19 +195,36 @@ def test_windows_missing_process_is_not_reported_alive(windows, monkeypatch, err
     assert not p.process_alive(123, 456)
 
 
-def test_kernel_abi_initialization_and_racing_cache(monkeypatch):
+@pytest.mark.parametrize("pointer_size", [4, 8])
+def test_kernel_abi_initialization_and_racing_cache(monkeypatch, pointer_size):
     """验证完整 ctypes 签名和双重检查锁，不使用真实 Windows DLL。"""
     names = ("CreateMutexW", "ReleaseMutex", "CreateEventW", "SetEvent", "WaitForSingleObject",
              "CloseHandle", "OpenProcess", "GetCurrentProcess", "GetProcessTimes")
     kernel = SimpleNamespace(**{name: Mock() for name in names})
+    immediate = SimpleNamespace(**{name: Mock() for name in names})
+    original_wait = kernel.WaitForSingleObject
     monkeypatch.setattr(p, "_KERNEL32", None)
+    monkeypatch.setattr(p.struct, "calcsize", lambda _format: pointer_size)
     loader = Mock(return_value=kernel)
+    immediate_loader = Mock(return_value=immediate)
     monkeypatch.setattr(p.ctypes, "WinDLL", loader, raising=False)
+    monkeypatch.setattr(p.ctypes, "PyDLL", immediate_loader)
     assert p._kernel32() is kernel
     assert p._kernel32() is kernel
     assert kernel.CreateMutexW.restype is ctypes.c_void_p
     assert kernel.CloseHandle.argtypes == [ctypes.c_void_p]
     assert loader.call_count == 1
+    assert kernel.WaitForSingleObject is original_wait
+    assert immediate_loader.call_count == (1 if pointer_size == 8 else 0)
+    if pointer_size == 8:
+        assert kernel._immediate_api is immediate
+        assert kernel._immediate_wait is immediate.WaitForSingleObject
+        assert kernel.ReleaseMutex is immediate.ReleaseMutex
+        assert kernel.SetEvent is immediate.SetEvent
+        assert immediate.WaitForSingleObject.argtypes == original_wait.argtypes
+        assert immediate.WaitForSingleObject.restype is original_wait.restype
+    else:
+        assert kernel._immediate_wait is None
     monkeypatch.setattr(p, "_KERNEL32", None)
 
     class RaceLock:
@@ -224,6 +241,31 @@ def test_kernel_abi_initialization_and_racing_cache(monkeypatch):
     monkeypatch.setattr(p, "_KERNEL_LOCK", RaceLock())
     assert p._kernel32() is kernel
     assert loader.call_count == 1
+
+
+@pytest.mark.parametrize("result", [p._WAIT_OBJECT_0, p._WAIT_ABANDONED, p._WAIT_TIMEOUT, p._WAIT_FAILED])
+def test_windows_immediate_wait_preserves_status_and_errors(windows, result):
+    """零预算只探测一次，保留废弃锁和系统错误，禁止隐式进入阻塞等待。"""
+    kernel, _mappings = windows
+    kernel._immediate_wait = Mock(return_value=result)
+    if result == p._WAIT_FAILED:
+        with pytest.raises(TransportError, match="WaitForSingleObject"):
+            p._wait_handle(123, 0)
+    else:
+        assert p._wait_handle(123, 0) == result
+    kernel._immediate_wait.assert_called_once_with(123, 0)
+    kernel.WaitForSingleObject.assert_not_called()
+
+
+def test_windows_immediate_wait_contention_keeps_original_deadline(windows, monkeypatch):
+    """非阻塞探测失败后使用释放 GIL 的等待，且扣除已花费的预算。"""
+    kernel, _mappings = windows
+    kernel._immediate_wait = Mock(return_value=p._WAIT_TIMEOUT)
+    monotonic = iter([10, 10.25])
+    monkeypatch.setattr(p, "time", SimpleNamespace(monotonic=lambda: next(monotonic)))
+    assert p._wait_handle(123, 1) == 0
+    kernel._immediate_wait.assert_called_once_with(123, 0)
+    kernel.WaitForSingleObject.assert_called_once_with(123, 750)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX 原语及 libc 故障审计")

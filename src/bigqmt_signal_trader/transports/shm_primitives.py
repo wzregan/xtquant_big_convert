@@ -229,6 +229,18 @@ def _kernel32():
         for name, signature in signatures.items():
             function = getattr(kernel, name)
             function.argtypes, function.restype = signature
+        kernel._immediate_wait = None
+        if struct.calcsize("P") == 8:
+            # Win64 采用统一调用约定。只对立即返回的操作保留 GIL，避免行情线程
+            # 竞争时每条消息在释放锁、唤醒等步骤反复等待 GIL；32 位仍使用 WinDLL。
+            immediate = ctypes.PyDLL("kernel32", use_last_error=True)
+            for name in ("ReleaseMutex", "SetEvent", "WaitForSingleObject"):
+                function = getattr(immediate, name)
+                function.argtypes, function.restype = signatures[name]
+            kernel.ReleaseMutex = immediate.ReleaseMutex
+            kernel.SetEvent = immediate.SetEvent
+            kernel._immediate_wait = immediate.WaitForSingleObject
+            kernel._immediate_api = immediate
         _KERNEL32 = kernel
         return kernel
 
@@ -242,6 +254,15 @@ def _wait_handle(handle, seconds):
     """在单调时钟预算内等待 Win32 对象，长有限超时拆分而非转成 INFINITE。"""
     kernel = _kernel32()
     deadline = time.monotonic() + seconds
+    immediate = getattr(kernel, "_immediate_wait", None)
+    if immediate is not None:
+        result = immediate(handle, 0)
+        if result == _WAIT_FAILED:
+            raise _windows_error("WaitForSingleObject failed")
+        if result != _WAIT_TIMEOUT or seconds == 0:
+            return result
+        # 只有零超时探测持有 GIL；锁竞争或事件未触发时，阻塞等待必须释放 GIL，
+        # 否则同进程的持锁者/通知者无法推进。沿用同一截止时间，不续期。
     while True:
         remaining = max(deadline - time.monotonic(), 0.0)
         milliseconds = (0xFFFFFFFE if remaining >= 0xFFFFFFFE / 1000.0
