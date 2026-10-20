@@ -203,6 +203,7 @@ def test_stop_during_manual_flush_retains_mapping_until_flush_exits(channel):
 
 def test_deadline_expiring_after_selecting_queue_preserves_head(channel, monkeypatch):
     """抢占发生在取队首之后时，剩余预算为零不得再提交。"""
+    channel.publish_checks_health = True
     publisher = BufferedAcknowledgedPublisher(channel, {"push_background_sender": False})
     publisher.publish("exec:trade", {"id": 1})
     with monkeypatch.context() as context:

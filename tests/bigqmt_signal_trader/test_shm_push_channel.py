@@ -518,22 +518,21 @@ def test_buffered_publish_waits_within_flush_budget(factory, monkeypatch, releas
     entered, release = threading.Event(), threading.Event()
 
     def hold_lock():
-        """健康检查结束后再占锁，复现发布前出现的真实并发竞争。"""
+        """正式提交前占锁，复现发布者与消费者确认之间的真实并发竞争。"""
         with server._region.locked(1):
             entered.set()
             release.wait(2 if release_after is None else release_after)
 
     thread = threading.Thread(target=hold_lock)
-    original_health = server.check_health
+    original_publish = server.publish
 
-    def health_then_contend():
-        """保证健康检查已通过且另一线程持锁，再让正式发布逻辑争用共享锁。"""
-        result = original_health()
+    def publish_with_contention(*args, **kwargs):
+        """保证另一线程已经持锁，再让真实提交路径在剩余预算内争锁。"""
         thread.start()
         assert entered.wait(1)
-        return result
+        return original_publish(*args, **kwargs)
 
-    monkeypatch.setattr(server, "check_health", health_then_contend)
+    monkeypatch.setattr(server, "publish", publish_with_contention)
     try:
         started = time.monotonic()
         committed = publisher.flush(max_wall_seconds=0.2 if release_after else 0.02)
@@ -552,7 +551,7 @@ def test_buffered_publish_waits_within_flush_budget(factory, monkeypatch, releas
     finally:
         release.set()
         thread.join(2)
-        monkeypatch.setattr(server, "check_health", original_health)
+        monkeypatch.setattr(server, "publish", original_publish)
     if release_after is None:
         assert publisher.flush() == 1
         assert publisher.status()["new_orders_blocked"] is False

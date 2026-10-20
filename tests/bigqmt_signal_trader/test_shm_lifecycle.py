@@ -199,8 +199,9 @@ def test_begin_request_transient_lock_timeout_rejects_only_this_request(transpor
     server, holder, client = transports(), transports(), transports()
     holder._open()
     locked = threading.Event()
+    release = threading.Event()
     released = threading.Event()
-    original_begin = server._begin_request
+    original_begin = server.begin_request
     holder_thread = None
     calls = []
     first = True
@@ -210,7 +211,8 @@ def test_begin_request_transient_lock_timeout_rejects_only_this_request(transpor
         try:
             with holder._locked(1.0):
                 locked.set()
-                time.sleep(0.1)
+                # 持锁直到本次执行门禁完成，避免线程调度变慢后测试意外放行。
+                assert release.wait(2.0)
         finally:
             released.set()
 
@@ -222,14 +224,17 @@ def test_begin_request_transient_lock_timeout_rejects_only_this_request(transpor
             holder_thread = threading.Thread(target=hold, daemon=True)
             holder_thread.start()
             assert locked.wait(1.0)
-        return original_begin(request)
+        try:
+            return original_begin(request)
+        finally:
+            release.set()
 
     def handle(request):
         """仅应收到第二条允许执行的业务请求。"""
         calls.append(request["params"]["value"])
         return _echo(request)
 
-    monkeypatch.setattr(server, "_begin_request", begin)
+    monkeypatch.setattr(server, "begin_request", begin)
     server.start_receiving(handle)
     try:
         with pytest.raises(SharedMemoryTimeout) as error:
@@ -245,6 +250,7 @@ def test_begin_request_transient_lock_timeout_rejects_only_this_request(transpor
         assert calls == ["fresh"]
         assert server.status()["executed"] == 1
     finally:
+        release.set()
         if holder_thread is not None:
             holder_thread.join(1.0)
             assert not holder_thread.is_alive()

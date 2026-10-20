@@ -90,6 +90,8 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
     """
 
     supports_acknowledgements = True
+    # 提交持锁期间校验完整健康，包装器可省去发送前重复探测，避免耗尽发送预算。
+    publish_checks_health = True
 
     def __init__(self, role="client", config=None, account_id="", print_prefix="[bigqmt_shm_push]"):
         """读取 shm 子配置并规划固定布局；实例持有的映射和线程由 stop 回收。
@@ -331,6 +333,14 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
                 candidates = [
                     (slot, self._consumer(slot)) for slot in range(self.max_consumers)
                 ] if refresh else ()
+                if (self.role == "server" and not allow_missing and not refresh
+                        and header.pid == os.getpid() == self._pid and header.birth == self._birth):
+                    # 发布者正在执行即可证明自身存活；没有对端探活任务时无需释放再抢锁。
+                    # 消费者始终保留锁外探活及二次身份校验，不能用此路径信任旧发布进程。
+                    if budget and time.monotonic() >= deadline:
+                        raise TransportTimeout("shared push operation budget exhausted")
+                    yield header
+                    return
             # /proc与Windows进程句柄调用可能释放GIL，绝不能让它们阻塞共享元数据锁。
             alive = ready and self._peer_alive(header.pid, header.birth)
             dead = {
@@ -463,6 +473,12 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
             self._write_lane(lane, state)
         return state
 
+    def _check_consumer_health(self, consumers):
+        """在共享锁内检查消费者失败证据，供健康查询和消息提交使用同一判定。"""
+        if any(consumer.state == _FAILED or consumer.stable & _CALLBACK_FAILED_FLAG
+               for _slot, consumer in consumers):
+            raise PushCallbackError("a shared push subscriber callback failed with unacknowledged messages")
+
     def _signal_name(self, identity):
         """每个订阅者使用独立提示，避免单个自动复位信号吞掉其它消费者唤醒。"""
         return endpoint_name(self.namespace, self.account_id, "push-data-" + identity.hex())
@@ -520,6 +536,7 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
                 with self._validated_lock(budget, maintain=True,
                                           force_maintenance=force_maintenance, deadline=deadline):
                     consumers = self._subscribers()
+                    self._check_consumer_health(consumers)
                     previous = self._published_ids.get(identity) if identity != _EMPTY_ID else None
                     if previous is not None:
                         previous_lane, seq = previous
@@ -780,9 +797,8 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
                     if not self._running or self._thread is None or not self._thread.is_alive():
                         raise SharedMemoryPushError("shared push subscriber worker exited")
                 else:
-                    consumers = [self._consumer(slot) for slot in range(self.max_consumers)]
-                    if any(consumer.state == _FAILED or consumer.stable & _CALLBACK_FAILED_FLAG for consumer in consumers):
-                        raise PushCallbackError("a shared push subscriber callback failed with unacknowledged messages")
+                    self._check_consumer_health(
+                        (slot, self._consumer(slot)) for slot in range(self.max_consumers))
         except TransportTimeout as exc:
             raise PushLockBusyError("shared push health check lock busy: %s" % exc)
         return self.status()

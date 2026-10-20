@@ -301,6 +301,8 @@ def test_probe_exhausting_positive_budget_cannot_commit(pair, monkeypatch, opera
     """探活耗尽正数总预算后必须停止写操作，不能把剩余零误作一次新的立即尝试。"""
     server, client = pair
     owner = client if operation == "ack" else server
+    # 发布者不再无条件探活自身；强制到期维护以覆盖真正需要系统查询的消费者路径。
+    server._next_maintenance = 0
     clock = [500.0]
     previous_published = server.status()["published"]
 

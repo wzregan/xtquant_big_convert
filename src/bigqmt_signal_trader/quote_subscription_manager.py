@@ -27,6 +27,7 @@ import uuid
 from collections import deque
 
 from .code_utils import normalize_stock_code
+from . import diagnostics
 from .quote_push_channel import QuotePushChannel
 from .quote_utils import is_option_code, latest_quote_batch
 from .transports.base import TransportError
@@ -352,15 +353,19 @@ class BufferedAcknowledgedPublisher(QuotePushChannel):
         self._last_backpressure = ""
         self._last_flush_seconds = 0.0
         self._max_flush_seconds = 0.0
+        self._last_health_check_seconds = 0.0
+        self._last_publish_seconds = 0.0
+        self._max_publish_seconds = 0.0
+        self._next_debug_at = 0.0
         self._peak_pending = {"exec": 0, "quote": 0}
         self._bytes = {"exec": 0, "quote": 0}
         self._capacities = {
             "exec": int(settings.get("local_exec_queue_items", 512)),
-            "quote": int(settings.get("local_quote_queue_items", 256)),
+            "quote": int(settings.get("local_quote_queue_items", 10240)),
         }
         self._byte_limits = {
             "exec": int(settings.get("local_exec_queue_bytes", 8 * 1024 * 1024)),
-            "quote": int(settings.get("local_quote_queue_bytes", 64 * 1024 * 1024)),
+            "quote": int(settings.get("local_quote_queue_bytes", 128 * 1024 * 1024)),
         }
         self._high_water = float(settings.get("local_queue_high_water", 0.75))
         if min(list(self._capacities.values()) + list(self._byte_limits.values())) <= 0:
@@ -422,7 +427,10 @@ class BufferedAcknowledgedPublisher(QuotePushChannel):
                 with self._lock:
                     if self._closed:
                         return
-                committed = self.flush(max_items=128, max_wall_seconds=0.02)
+                # 后台线程不占用 QMT 策略回调。20ms 太贴近 Windows 调度粒度，
+                # 重获 GIL 后可能尚未提交就已到期，反复重试反而压低吞吐。
+                # 整批共用 200ms 预算，逐条重新优先选择交易回报；主线程刷新预算不变。
+                committed = self.flush(max_items=128, max_wall_seconds=0.2)
                 with self._lock:
                     pending = any(self._queues.values()) and not self._publishing_failed
                 if not pending or committed == 0:
@@ -449,7 +457,7 @@ class BufferedAcknowledgedPublisher(QuotePushChannel):
                 self._sticky_error = "push snapshot failed: %s: %s" % (type(exc).__name__, exc)
                 self._last_error = self._sticky_error
             raise TransportError(self._sticky_error)
-        entry = (uuid.uuid4().hex, str(topic), snapshot, retained_bytes)
+        entry = (uuid.uuid4().hex, str(topic), snapshot, retained_bytes, time.monotonic())
         with self._lock:
             if self._closed:
                 self._sticky_error = "acknowledged publisher is closed"
@@ -483,6 +491,16 @@ class BufferedAcknowledgedPublisher(QuotePushChannel):
                 self._last_flush_seconds = elapsed
                 self._max_flush_seconds = max(self._max_flush_seconds, elapsed)
             self._flush_lock.release()
+            self._debug_progress()
+
+    def _debug_progress(self):
+        """仅开启 BIGQMT_DEBUG 时每秒输出一次有界积压及耗时诊断。"""
+        if not diagnostics.enabled():
+            return
+        now = time.monotonic()
+        if now >= self._next_debug_at:
+            self._next_debug_at = now + 1.0
+            diagnostics.trace("push_progress", state=self.status())
 
     def _flush_pending(self, max_items, max_wall_seconds):
         """单写者持锁期间发送，交易优先，失败队首保持相同编号及数据。"""
@@ -491,24 +509,12 @@ class BufferedAcknowledgedPublisher(QuotePushChannel):
         with self._lock:
             if self._closed or self._publishing_failed:
                 return 0
-        try:
-            self._channel.check_health()
-        except Exception as exc:
-            with self._lock:
-                self._last_error = "%s: %s" % (type(exc).__name__, exc)
-                self._backpressure_count += int(bool(getattr(exc, "retryable", False)))
-                self._last_backpressure = self._last_error
-                if getattr(exc, "retryable", False):
-                    # 健康元数据锁繁忙不表示游标丢失，下一轮重查且保留现有队列。
-                    self._health_busy = True
-                else:
-                    self._sticky_error = self._last_error
-                    self._publishing_failed = True
-            return 0
-        with self._lock:
-            if self._health_busy:
-                self._health_busy = False
-                self._last_error = ""
+            pending = any(self._queues.values())
+        # SHM 在实际提交的同一把共享锁内检查代次和消费者故障，重复巡检会消耗整批
+        # 发送预算。空闲时仍巡检；旧的确认型后端没有声明此保证时沿用前置检查。
+        if not pending or getattr(self._channel, "publish_checks_health", False) is not True:
+            if not self._check_channel_health():
+                return 0
         while committed < max(0, int(max_items)) and time.monotonic() < deadline:
             with self._lock:
                 if self._closed:
@@ -525,8 +531,14 @@ class BufferedAcknowledgedPublisher(QuotePushChannel):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return committed
-                self._channel.publish(entry[1], entry[2], message_id=entry[0],
-                                      timeout_seconds=remaining)
+                published_at = time.monotonic()
+                try:
+                    self._channel.publish(entry[1], entry[2], message_id=entry[0],
+                                          timeout_seconds=remaining)
+                finally:
+                    elapsed = time.monotonic() - published_at
+                    self._last_publish_seconds = elapsed
+                    self._max_publish_seconds = max(self._max_publish_seconds, elapsed)
             except Exception as exc:
                 with self._lock:
                     self._last_error = "%s: %s" % (type(exc).__name__, exc)
@@ -550,12 +562,39 @@ class BufferedAcknowledgedPublisher(QuotePushChannel):
                     committed += 1
                     self._backpressure = False
                     self._publish_busy = False
+                    self._health_busy = False
                     self._last_error = ""
         return committed
+
+    def _check_channel_health(self):
+        """空闲或旧后端发送前检查健康；失败保留原队首及可重试语义。"""
+        started = time.monotonic()
+        try:
+            self._channel.check_health()
+        except Exception as exc:
+            with self._lock:
+                self._last_error = "%s: %s" % (type(exc).__name__, exc)
+                self._backpressure_count += int(bool(getattr(exc, "retryable", False)))
+                self._last_backpressure = self._last_error
+                if getattr(exc, "retryable", False):
+                    # 健康元数据锁繁忙不表示游标丢失，下一轮重查且保留现有队列。
+                    self._health_busy = True
+                else:
+                    self._sticky_error = self._last_error
+                    self._publishing_failed = True
+            return False
+        finally:
+            self._last_health_check_seconds = time.monotonic() - started
+        with self._lock:
+            if self._health_busy:
+                self._health_busy = False
+                self._last_error = ""
+        return True
 
     def status(self):
         """返回本地接收、共享提交和故障状态，不把入队等同于对端确认。"""
         with self._lock:
+            now = time.monotonic()
             pending = {lane: len(items) for lane, items in self._queues.items()}
             high_water = any(
                 pending[lane] >= max(1, self._capacities[lane] * self._high_water)
@@ -567,6 +606,11 @@ class BufferedAcknowledgedPublisher(QuotePushChannel):
             return {
                 "healthy": not blocked, "new_orders_blocked": blocked,
                 "local_pending": pending, "local_pending_bytes": dict(self._bytes),
+                "local_queue_items": dict(self._capacities), "local_queue_bytes": dict(self._byte_limits),
+                "oldest_pending_seconds": {
+                    lane: max(0.0, now - items[0][4]) if items else 0.0
+                    for lane, items in self._queues.items()
+                },
                 "local_queued": self._local_queued, "shared_committed": self._shared_committed,
                 "sticky_error": self._sticky_error, "last_error": self._last_error,
                 "overflow_count": self._overflow_count, "pending_at_stop": self._pending_at_stop,
@@ -582,6 +626,9 @@ class BufferedAcknowledgedPublisher(QuotePushChannel):
                 "last_backpressure": self._last_backpressure,
                 "last_flush_seconds": self._last_flush_seconds,
                 "max_flush_seconds": self._max_flush_seconds,
+                "last_health_check_seconds": self._last_health_check_seconds,
+                "last_publish_seconds": self._last_publish_seconds,
+                "max_publish_seconds": self._max_publish_seconds,
             }
 
     def check_health(self):

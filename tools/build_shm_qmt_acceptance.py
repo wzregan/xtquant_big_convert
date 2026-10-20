@@ -28,14 +28,17 @@ def acceptance_config(namespace=DEFAULT_NAMESPACE, directory=None, mode="read-on
         "rpc_slot_bytes": 65536,
         "max_payload_bytes": 64 * 1024 * 1024,
         "wait_poll_seconds": 0.05,
-        "market_push_bytes": 24 * 1024 * 1024,
+        "market_push_bytes": 64 * 1024 * 1024,
         "trade_push_bytes": 8 * 1024 * 1024,
-        "market_push_slots": 4096,
+        "market_push_slots": 16384,
         "trade_push_slots": 1024,
         "max_push_subscribers": 64,
         "push_codec": "json",
         "push_poll_seconds": 0.05,
         "subscriber_retention_seconds": 300.0,
+        # 本地按批数及保留对象字节双重约束；共享布局必须随客户端配置一起交付。
+        "local_quote_queue_items": 10240,
+        "local_quote_queue_bytes": 128 * 1024 * 1024,
     }
     if directory is not None:
         shm["directory"] = os.path.abspath(directory)
