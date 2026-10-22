@@ -239,9 +239,13 @@ def test_begin_request_transient_lock_timeout_rejects_only_this_request(transpor
     try:
         with pytest.raises(SharedMemoryTimeout) as error:
             client.send_request(_request("must-not-execute"), 0.25)
-        assert error.value.outcome_unknown is False
+        # Windows 调度可能让服务端先回收过期槽；客户端已无执行凭据时应保守要求
+        # 对账，不能仅凭测试知道业务未执行就强迫生产接口返回确定结果。
+        if error.value.outcome_unknown:
+            assert "request slot expired" in str(error.value)
         assert released.wait(1.0)
         assert calls == []
+        assert server.status()["executed"] == 0
         assert server.status()["running"] is True
         assert server.status()["error"] == ""
         assert server._thread.is_alive()

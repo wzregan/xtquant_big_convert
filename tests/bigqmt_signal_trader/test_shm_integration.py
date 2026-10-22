@@ -128,7 +128,8 @@ def test_queue_snapshots_native_payload_and_prioritizes_execution():
         ("exec:trade", {"volume": 100}),
         ("510300.SH", {"510300.SH": {"lastPrice": 4.1, "bid": [4.0]}}),
     ]
-    assert all(0.0 < timeout <= 0.01 for _, timeout in channel.attempts)
+    # 两个较大的单调时间戳相减存在浮点舍入；只允许纳秒量级误差，不放宽业务超时。
+    assert all(0.0 < timeout <= 0.01 + 1e-8 for _, timeout in channel.attempts)
     assert channel.attempts[1][1] <= channel.attempts[0][1]
 
 

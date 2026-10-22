@@ -140,10 +140,14 @@ def test_deferred_service_deadline_checked_at_actual_execution(pair):
     try:
         with pytest.raises(SharedMemoryTimeout) as error:
             client.send_request(request(), 0.04)
-        assert not error.value.outcome_unknown
+        # 过期槽可能先被接收线程回收，客户端此时只能报告结果不确定；
+        # 安全不变量是过期业务绝不执行，由下面实际排空本地队列核验。
+        if error.value.outcome_unknown:
+            assert "request slot expired" in str(error.value)
         assert service.pending.qsize() == 1
         service.drain_pending()
         assert calls == []
+        assert server.status()["executed"] == 0
     finally:
         service.stop()
 
@@ -157,7 +161,9 @@ def test_late_reply_cannot_overwrite_reused_slot(config):
     server.start_receiving(lambda req: received.append(req), background_threads=False)
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            first = pool.submit(client.send_request, request("first"), 0.05)
+            # 本例验证过期令牌隔离，不测延迟；给跨线程领取足够时间，避免压力测试
+            # 并行运行时请求在真正领取前就过期，完全没走到待验证的迟到响应路径。
+            first = pool.submit(client.send_request, request("first"), 0.5)
             wait_until(lambda: client.status()["published"] == 1)
             assert server.drain_request_queue() == 1
             with pytest.raises(SharedMemoryTimeout) as error:

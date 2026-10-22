@@ -599,12 +599,13 @@ def test_old_publisher_stop_does_not_clear_new_generation(factory):
     """旧发布者退出不得把新代次的持有者标记清零。"""
     server = factory("server")
     server.start_publisher()
+    # Windows 最后一个映射句柄关闭就销毁数据；新持有者必须先打开，才是在测试代次交接。
+    observer = factory("client")
+    observer._open()
     with server._region.locked(1):
         header = server._header()._replace(epoch=b"n" * 16)
         module._HEADER.pack_into(server._region.buffer, 0, *header)
     server.stop()
-    observer = factory("client")
-    observer._open()
     assert observer._header() == header
     with observer._region.locked(1):
         module._HEADER.pack_into(observer._region.buffer, 0, *header._replace(pid=0))

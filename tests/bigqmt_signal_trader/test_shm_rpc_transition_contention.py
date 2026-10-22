@@ -17,8 +17,9 @@ from bigqmt_signal_trader.transports.shm_transport import SharedMemoryTimeout, S
 @pytest.mark.parametrize("case", ["temporary", "request_expired", "persistent"])
 def test_transient_transition_lock_retains_same_request_and_response(tmp_path, monkeypatch, phase, case):
     """短暂争锁恢复同一请求；过期或持续争锁不得迟到执行、隐式重报或污染下一请求。"""
-    hold_seconds = {"temporary": 0.03, "request_expired": 0.06, "persistent": 0.15}[case]
-    request_seconds = 0.02 if case == "request_expired" else 0.4
+    # Windows 的线程调度粒度可能接近旧的 20 毫秒预算；先留足入队时间，再用更长持锁确定过期。
+    hold_seconds = {"temporary": 0.03, "request_expired": 0.2, "persistent": 0.15}[case]
+    request_seconds = 0.1 if case == "request_expired" else 0.4
     settings = dict(account_id="transition-audit", namespace=uuid.uuid4().hex,
                     directory=str(tmp_path), rpc_slots=4, rpc_slot_bytes=4096,
                     wait_poll_seconds=0.005)

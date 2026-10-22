@@ -136,7 +136,8 @@ def test_external_response_open_uses_remaining_rpc_deadline(endpoints, monkeypat
             client.send_request({"request_id": "response-budget", "method": "synthetic", "params": {}}, 0.03)
         assert captured.value.outcome_unknown is True
         assert time.monotonic() - before < 0.10
-        assert opening_budgets and all(0 <= value <= 0.03 for value in opening_budgets)
+        # 单调时钟绝对值相减会有浮点舍入，仅容忍纳秒误差，不放宽实际等待期限。
+        assert opening_budgets and all(0 <= value <= 0.03 + 1e-9 for value in opening_budgets)
     finally:
         for owner in owners:
             owner.join(1.0)
