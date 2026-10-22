@@ -11,6 +11,7 @@ import uuid
 import zlib
 from collections import namedtuple
 
+from . import diagnostics
 from .quote_push_channel import QuotePushChannel
 from .transports.base import TransportError, TransportTimeout
 from .transports.shm_primitives import (
@@ -168,6 +169,13 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
         self._missed_hints = 0
         self._published = 0
         self._acknowledged = 0
+        self._pending_acks = {}
+        self._consumer_lock_timeouts = 0
+        self._next_lock_debug_at = 0.0
+        self._peer_probe_count = 0
+        self._last_peer_probe_seconds = 0.0
+        self._max_peer_probe_seconds = 0.0
+        self._liveness_timeouts = 0
 
     @property
     def publisher_endpoint(self):
@@ -250,8 +258,8 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
             raise PushGapError("uncommitted or overwritten push record lane=%s sequence=%s" % (lane, seq))
         return record
 
-    def _read_bytes(self, lane, record):
-        """从可跨越环尾的日志复制消息，并验证 CRC 后交给业务解码器。"""
+    def _read_bytes(self, lane, record, check_crc=True):
+        """复制环形日志；check_crc=False 时调用方必须在解码前于锁外验证 CRC。"""
         capacity = self.capacities[lane]
         start = record.pos % capacity
         count = min(record.length, capacity - start)
@@ -259,9 +267,14 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
         payload = bytes(self._region.buffer[offset + start:offset + start + count])
         if count < record.length:
             payload += bytes(self._region.buffer[offset:offset + record.length - count])
+        if check_crc:
+            self._check_crc(lane, record, payload)
+        return payload
+
+    def _check_crc(self, lane, record, payload):
+        """验证不可变消息快照；大块 zlib 运算会释放 GIL，正常收发必须在共享锁外调用。"""
         if zlib.crc32(payload) & 0xffffffff != record.crc:
             raise PushGapError("push payload CRC mismatch lane=%s sequence=%s" % (lane, record.seq))
-        return payload
 
     def _validate(self, abandoned=False):
         """在锁内只核对协议、代次与故障位；存活检查由 _validated_lock 在锁外完成。"""
@@ -292,7 +305,25 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
         """当前执行进程的完整身份可直接证明存活，其余身份每轮重新向操作系统查询。"""
         if pid == os.getpid() == self._pid and birth == self._birth:
             return True
-        return process_alive(pid, birth)
+        started = time.monotonic()
+        try:
+            return process_alive(pid, birth)
+        finally:
+            elapsed = time.monotonic() - started
+            self._peer_probe_count += 1
+            self._last_peer_probe_seconds = elapsed
+            self._max_peer_probe_seconds = max(self._max_peer_probe_seconds, elapsed)
+
+    def _liveness_timeout(self, stage):
+        """记录探活预算耗尽的具体阶段，只有开启调试时才输出限频日志。"""
+        self._liveness_timeouts += 1
+        if diagnostics.enabled() and time.monotonic() >= self._next_lock_debug_at:
+            self._next_lock_debug_at = time.monotonic() + 1.0
+            diagnostics.trace("push_liveness_timeout", role=self.role, stage=stage,
+                              count=self._liveness_timeouts,
+                              last_probe_seconds=self._last_peer_probe_seconds,
+                              max_probe_seconds=self._max_peer_probe_seconds)
+        return TransportTimeout("shared push liveness check exhausted operation budget: " + stage)
 
     @contextlib.contextmanager
     def _validated_lock(self, timeout_seconds, maintain=False, allow_missing=False,
@@ -343,21 +374,26 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
                     return
             # /proc与Windows进程句柄调用可能释放GIL，绝不能让它们阻塞共享元数据锁。
             alive = ready and self._peer_alive(header.pid, header.birth)
-            dead = {
-                (slot, consumer.identity, consumer.token, consumer.pid, consumer.birth)
-                for slot, consumer in candidates
-                if consumer.state in (_ACTIVE, _FAILED)
-                and not self._peer_alive(consumer.pid, consumer.birth)
-            }
+            # 同一 gRPC 进程可占用多个订阅槽；本轮按完整进程身份探活一次，
+            # 但死亡证据仍逐槽绑定 token，避免旧探针清理重连后的新订阅。
+            peers, dead = {}, set()
+            for slot, consumer in candidates:
+                if consumer.state not in (_ACTIVE, _FAILED):
+                    continue
+                peer = (consumer.pid, consumer.birth)
+                if peer not in peers:
+                    peers[peer] = self._peer_alive(*peer)
+                if not peers[peer]:
+                    dead.add((slot, consumer.identity, consumer.token, consumer.pid, consumer.birth))
             if budget and time.monotonic() >= deadline:
-                raise TransportTimeout("shared push liveness check exhausted operation budget")
+                raise self._liveness_timeout("peer_probe")
             with region.locked(min(self.lock_timeout, max(0.0, deadline - time.monotonic()))) as abandoned:
                 if self._region is not region:
                     raise PushGapError("shared push mapping changed during operation")
                 if abandoned:
                     self._validate(abandoned=True)
                 if budget and time.monotonic() >= deadline:
-                    raise TransportTimeout("shared push liveness check exhausted operation budget")
+                    raise self._liveness_timeout("commit_lock")
                 current = self._header()
                 if (current.epoch, current.pid, current.birth) != owner:
                     if allow_missing:
@@ -475,9 +511,14 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
 
     def _check_consumer_health(self, consumers):
         """在共享锁内检查消费者失败证据，供健康查询和消息提交使用同一判定。"""
-        if any(consumer.state == _FAILED or consumer.stable & _CALLBACK_FAILED_FLAG
-               for _slot, consumer in consumers):
-            raise PushCallbackError("a shared push subscriber callback failed with unacknowledged messages")
+        failed = False
+        for _slot, consumer in consumers:
+            if consumer.stable & _CALLBACK_FAILED_FLAG:
+                raise PushCallbackError("a shared push subscriber callback failed with unacknowledged messages")
+            failed = failed or consumer.state == _FAILED
+        # FAILED 也可能来自协议损坏或传输故障；只有专门的标志能证明回调执行失败。
+        if failed:
+            raise SharedMemoryPushError("a shared push subscriber failed; explicit recovery required")
 
     def _signal_name(self, identity):
         """每个订阅者使用独立提示，避免单个自动复位信号吞掉其它消费者唤醒。"""
@@ -526,11 +567,14 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
         payload = self._encode_payload(topic, data)
         if len(payload) > self.capacities[lane]:
             raise SharedMemoryPushError("push payload exceeds lane capacity")
+        # zlib 对较大消息会释放 GIL；必须先计算，不能拿着跨进程锁等待重新取得 GIL。
+        payload_crc = zlib.crc32(payload) & 0xffffffff
         budget = self.publish_timeout if timeout_seconds is None else _seconds(
             {"timeout": timeout_seconds}, "timeout", self.publish_timeout)
         deadline = time.monotonic() + budget
         identity = _EMPTY_ID if message_id is None else hashlib.sha256(str(message_id).encode("utf-8")).digest()
         force_maintenance = False
+        duplicate = None
         while True:
             try:
                 with self._validated_lock(budget, maintain=True,
@@ -540,10 +584,11 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
                     previous = self._published_ids.get(identity) if identity != _EMPTY_ID else None
                     if previous is not None:
                         previous_lane, seq = previous
-                        record = self._record(previous_lane, seq)
-                        if previous_lane != lane or self._read_bytes(previous_lane, record) != payload:
+                        if previous_lane != lane:
                             raise SharedMemoryPushError("message_id reused with different push payload")
-                        return True
+                        record = self._record(lane, seq)
+                        duplicate = (record, self._read_bytes(lane, record, check_crc=False))
+                        break
                     state = self._lane(lane)
                     if state.next_seq - state.head >= self.slot_counts[lane] or state.write_pos - state.reclaim_pos + len(payload) > self.capacities[lane]:
                         # 有空余空间时保留历史即可；真正遇到容量边界才批量读取 ACK 并回收。
@@ -559,7 +604,7 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
                     if state.next_seq - state.head < self.slot_counts[lane] and state.write_pos - state.reclaim_pos + len(payload) <= self.capacities[lane]:
                         seq = state.next_seq
                         offset = self._index_offsets[lane] + (seq % self.slot_counts[lane]) * _RECORD.size
-                        record = _Record(seq, state.write_pos, len(payload), zlib.crc32(payload) & 0xffffffff, 0, identity)
+                        record = _Record(seq, state.write_pos, len(payload), payload_crc, 0, identity)
                         _RECORD.pack_into(self._region.buffer, offset, *record)
                         start = state.write_pos % self.capacities[lane]
                         count = min(len(payload), self.capacities[lane] - start)
@@ -580,6 +625,12 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
             if remaining <= 0:
                 raise PushBackpressureError("shared push lane full; unacknowledged messages retained")
             self._space_signal.wait(min(remaining, self.poll_interval))
+        if duplicate is not None:
+            record, previous_payload = duplicate
+            self._check_crc(lane, record, previous_payload)
+            if previous_payload != payload:
+                raise SharedMemoryPushError("message_id reused with different push payload")
+            return True
         self._notify(consumers, lane)
         return True
 
@@ -599,6 +650,7 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
         self._lanes = tuple(lane for lane in (1, 0) if lane_mask & (1 << lane))
         self._token = uuid.uuid4().bytes
         self._error = None
+        self._pending_acks.clear()
         self._epoch = None
         deadline = time.monotonic() + self.init_timeout
         self._open(max(0.0, deadline - time.monotonic()))
@@ -713,7 +765,10 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
                 raise PushGapError("shared push cursor fell behind retained history")
             if seq >= state.next_seq:
                 return None
-            return seq, self._read_bytes(lane, self._record(lane, seq))
+            record = self._record(lane, seq)
+            payload = self._read_bytes(lane, record, check_crc=False)
+        self._check_crc(lane, record, payload)
+        return seq, payload
 
     def _ack(self, lane, seq):
         """仅在对应回调成功后推进一次确认，后续订阅实例可据此恢复。"""
@@ -732,30 +787,47 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
             self._signal_errors += 1
 
     def _consume(self, on_msg):
-        """公平轮询两个日志，回调失败保持游标并退出，避免无界重复副作用。"""
+        """轮询两个日志；锁超时原地重试，已完成回调的消息只重试确认。
+
+        回调失败仍保留原游标并退出；停止请求必须等待已执行消息确认完成，
+        不能把确认锁超时误当成未处理消息，再次执行下单或记账等业务副作用。
+        """
         try:
-            while self._running:
+            while self._running or self._pending_acks:
                 progress = False
                 for lane in self._lanes:
-                    if not self._running:
-                        break
-                    message = self._next_message(lane)
-                    if message is None:
+                    if not self._running and lane not in self._pending_acks:
                         continue
-                    progress = True
-                    seq, raw = message
-                    decoded = self._decode_payload(raw)
-                    if not isinstance(decoded, dict) or "combo_key" not in decoded:
-                        raise PushGapError("shared push message envelope is invalid")
-                    topic = decoded["combo_key"]
-                    if topic in self._topics:
-                        try:
-                            on_msg(topic, decoded.get("data"))
-                        except Exception as exc:
-                            raise PushCallbackError("push callback failed; message is unacknowledged: %s" % exc)
-                    # 回调内 stop 只设置停止标记，仍须先确认这条成功消息再退出。
-                    self._ack(lane, seq)
-                if not progress and self._running:
+                    stage = "ack" if lane in self._pending_acks else "read"
+                    try:
+                        if lane not in self._pending_acks:
+                            message = self._next_message(lane)
+                            if message is None:
+                                continue
+                            seq, raw = message
+                            decoded = self._decode_payload(raw)
+                            if not isinstance(decoded, dict) or "combo_key" not in decoded:
+                                raise PushGapError("shared push message envelope is invalid")
+                            topic = decoded["combo_key"]
+                            if topic in self._topics:
+                                try:
+                                    on_msg(topic, decoded.get("data"))
+                                except Exception as exc:
+                                    # 业务自己抛出的超时也属于回调失败，不能被外层当作锁忙重试。
+                                    raise PushCallbackError("push callback failed; message is unacknowledged: %s" % exc)
+                            self._pending_acks[lane] = seq
+                            stage = "ack"
+                        self._ack(lane, self._pending_acks[lane])
+                        self._pending_acks.pop(lane)
+                        progress = True
+                    except TransportTimeout as exc:
+                        self._consumer_lock_timeouts += 1
+                        if diagnostics.enabled() and time.monotonic() >= self._next_lock_debug_at:
+                            self._next_lock_debug_at = time.monotonic() + 1.0
+                            diagnostics.trace("push_consumer_lock_busy", lane=lane, stage=stage,
+                                              pending_ack=self._pending_acks.get(lane),
+                                              count=self._consumer_lock_timeouts, error=str(exc))
+                if not progress and (self._running or self._pending_acks):
                     self._data_signal.wait(self.poll_interval)
         except Exception as exc:
             self._error = exc if isinstance(exc, SharedMemoryPushError) else SharedMemoryPushError(str(exc))
@@ -806,11 +878,17 @@ class SharedMemoryQuotePushChannel(QuotePushChannel):
     def status(self):
         """返回不触发重试或回调的本地诊断快照。"""
         return {"backend": "shm", "role": self.role, "push_codec": self.push_codec, "started": self._started,
+                "peer_probe_count": self._peer_probe_count,
+                "last_peer_probe_seconds": self._last_peer_probe_seconds,
+                "max_peer_probe_seconds": self._max_peer_probe_seconds,
+                "liveness_timeouts": self._liveness_timeouts,
                 "running": self._running, "epoch": self._epoch.hex() if self._epoch else "",
                 "subscriber_id": self.subscriber_id if self.role == "client" else "",
                 "published": self._published, "acknowledged": self._acknowledged,
                 "signal_errors": self._signal_errors,
                 "missed_hints": self._missed_hints,
+                "consumer_lock_timeouts": self._consumer_lock_timeouts,
+                "pending_acknowledgements": len(self._pending_acks),
                 "callback_failed": isinstance(self._error, PushCallbackError),
                 "error": str(self._error) if self._error is not None else ""}
 
