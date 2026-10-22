@@ -221,6 +221,8 @@ def test_kernel_abi_initialization_and_racing_cache(monkeypatch, pointer_size):
         assert kernel._immediate_wait is immediate.WaitForSingleObject
         assert kernel.ReleaseMutex is immediate.ReleaseMutex
         assert kernel.SetEvent is immediate.SetEvent
+        for name in ("OpenProcess", "GetProcessTimes", "CloseHandle"):
+            assert getattr(kernel, name) is getattr(immediate, name)
         assert immediate.WaitForSingleObject.argtypes == original_wait.argtypes
         assert immediate.WaitForSingleObject.restype is original_wait.restype
     else:
@@ -266,6 +268,65 @@ def test_windows_immediate_wait_contention_keeps_original_deadline(windows, monk
     assert p._wait_handle(123, 1) == 0
     kernel._immediate_wait.assert_called_once_with(123, 0)
     kernel.WaitForSingleObject.assert_called_once_with(123, 750)
+
+
+@pytest.mark.parametrize("result", [p._WAIT_OBJECT_0, p._WAIT_ABANDONED, p._WAIT_TIMEOUT, p._WAIT_FAILED])
+def test_windows_mutex_zero_budget_never_waits_without_gil(windows, result):
+    """互斥零预算只探测一次，并保留废弃状态及系统错误语义。"""
+    kernel, _mappings = windows
+    kernel._immediate_wait = Mock(return_value=result)
+    if result == p._WAIT_FAILED:
+        with pytest.raises(TransportError, match="WaitForSingleObject"):
+            p._take_windows_mutex(123, 0)
+    else:
+        assert p._take_windows_mutex(123, 0) == result
+    kernel._immediate_wait.assert_called_once_with(123, 0)
+    kernel.WaitForSingleObject.assert_not_called()
+
+
+@pytest.mark.parametrize("expires", [False, True])
+def test_windows_mutex_contention_backs_off_without_owning_lock(windows, monkeypatch, expires):
+    """竞争期间短等待始终保留 GIL，重新调度的时间计入同一个截止。"""
+    kernel, _mappings = windows
+    now = [10.0]
+    sleeps = []
+
+    def sleep(seconds):
+        """正常推进短暂退避，或模拟长原生调用阻塞后才重新取得 GIL。"""
+        sleeps.append(seconds)
+        now[0] += 2 if expires else seconds
+
+    kernel._immediate_wait = Mock(side_effect=[p._WAIT_TIMEOUT, p._WAIT_TIMEOUT, p._WAIT_OBJECT_0])
+    monkeypatch.setattr(p, "time", SimpleNamespace(monotonic=lambda: now[0], sleep=sleep))
+    result = p._take_windows_mutex(123, 1)
+    assert result == (p._WAIT_TIMEOUT if expires else p._WAIT_OBJECT_0)
+    assert kernel._immediate_wait.call_count == (2 if expires else 3)
+    assert sleeps == [0]
+    kernel.WaitForSingleObject.assert_not_called()
+
+
+def test_windows_mutex_long_contention_sleeps_periodically(windows, monkeypatch):
+    """长期竞争由内核短等待消耗预算，不能忙等或进入释放 GIL 的无限等待。"""
+    kernel, _mappings = windows
+    now = [0.0]
+    sleeps = []
+
+    def sleep(seconds):
+        """记录让出执行权动作；本例耗时来自内核等待。"""
+        sleeps.append(seconds)
+
+    def wait(handle, milliseconds):
+        """模拟锁始终被占用，核对每次保留 GIL 的等待有严格上限。"""
+        assert handle == 123 and 0 <= milliseconds <= 1
+        now[0] += milliseconds / 1000.0
+        return p._WAIT_TIMEOUT
+
+    kernel._immediate_wait = Mock(side_effect=wait)
+    monkeypatch.setattr(p, "time", SimpleNamespace(monotonic=lambda: now[0], sleep=sleep))
+    assert p._take_windows_mutex(123, 0.002) == p._WAIT_TIMEOUT
+    assert sleeps == [0]
+    assert [call.args[1] for call in kernel._immediate_wait.call_args_list] == [0, 1, 1]
+    kernel.WaitForSingleObject.assert_not_called()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX 原语及 libc 故障审计")

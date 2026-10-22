@@ -234,11 +234,14 @@ def _kernel32():
             # Win64 采用统一调用约定。只对立即返回的操作保留 GIL，避免行情线程
             # 竞争时每条消息在释放锁、唤醒等步骤反复等待 GIL；32 位仍使用 WinDLL。
             immediate = ctypes.PyDLL("kernel32", use_last_error=True)
-            for name in ("ReleaseMutex", "SetEvent", "WaitForSingleObject"):
+            for name in ("ReleaseMutex", "SetEvent", "WaitForSingleObject",
+                         "OpenProcess", "GetProcessTimes", "CloseHandle"):
                 function = getattr(immediate, name)
                 function.argtypes, function.restype = signatures[name]
-            kernel.ReleaseMutex = immediate.ReleaseMutex
-            kernel.SetEvent = immediate.SetEvent
+            # 探活的打开句柄、读创建时间、关闭句柄都是同步查询；逐个释放 GIL 会让
+            # QMT 行情线程反复抢占，微秒级查询累计拖穿整批发送预算。阻塞等待仍走 WinDLL。
+            for name in ("ReleaseMutex", "SetEvent", "OpenProcess", "GetProcessTimes", "CloseHandle"):
+                setattr(kernel, name, getattr(immediate, name))
             kernel._immediate_wait = immediate.WaitForSingleObject
             kernel._immediate_api = immediate
         _KERNEL32 = kernel
@@ -272,6 +275,43 @@ def _wait_handle(handle, seconds):
             raise _windows_error("WaitForSingleObject failed")
         if result != _WAIT_TIMEOUT or time.monotonic() >= deadline:
             return result
+
+
+def _take_windows_mutex(handle, seconds):
+    """在持有 GIL 时取得 Win64 mutex，每次等待最多一毫秒。
+
+    阻塞 WinDLL 等待可能先取得跨进程 mutex、再等待 Python GIL；QMT 原生调用
+    长时间占用 GIL 时，尚未进入 Python 临界区的线程就会阻塞所有对端。
+    首次只探测；竞争时先短暂进入内核等待队列，超时后在锁外让出 GIL，让同进程持锁者
+    有机会释放锁。每次至多一毫秒，避免无限阻塞 GIL；总量仍受 seconds 秒预算限制。
+    无保留 GIL 接口的 32 位环境沿用原 ABI，事件等待仍使用 _wait_handle。
+    """
+    immediate = getattr(_kernel32(), "_immediate_wait", None)
+    if immediate is None:
+        return _wait_handle(handle, seconds)
+    deadline = time.monotonic() + seconds
+    wait_ms = 0
+    while True:
+        result = immediate(handle, wait_ms)
+        if result == _WAIT_FAILED:
+            raise _windows_error("WaitForSingleObject failed")
+        if result != _WAIT_TIMEOUT:
+            return result
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return _WAIT_TIMEOUT
+        # 零等待失败通常只是撞上对端的短临界区。先排队等一毫秒，避免直接让出
+        # GIL 后被行情回调抢占；否则每次短竞争都可能变成上百毫秒且始终抢不到锁。
+        if wait_ms == 0 and remaining >= 0.001:
+            wait_ms = 1
+            continue
+        # 只让出执行权；按毫秒 sleep 可能错过连续短临界区而饿死高并发请求。
+        time.sleep(0)
+        # GIL 竞争也消耗期限；超时后不能再取得锁并进入临界区。
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return _WAIT_TIMEOUT
+        wait_ms = 1 if remaining >= 0.001 else 0
 
 
 class SharedRegion(_Lifecycle):
@@ -314,7 +354,7 @@ class SharedRegion(_Lifecycle):
         self._mutex = kernel.CreateMutexW(None, False, _windows_name(self.name, "mutex"))
         if not self._mutex:
             raise _windows_error("CreateMutexW failed")
-        result = _wait_handle(self._mutex, max(deadline - time.monotonic(), 0.0))
+        result = _take_windows_mutex(self._mutex, max(deadline - time.monotonic(), 0.0))
         if result not in (_WAIT_OBJECT_0, _WAIT_ABANDONED):
             raise TransportTimeout("shared-memory initialization mutex timed out")
         self._initialization_abandoned = result == _WAIT_ABANDONED
@@ -371,7 +411,7 @@ class SharedRegion(_Lifecycle):
             acquired = False
             try:
                 if os.name == "nt":
-                    result = _wait_handle(self._mutex, max(deadline - time.monotonic(), 0.0))
+                    result = _take_windows_mutex(self._mutex, max(deadline - time.monotonic(), 0.0))
                     acquired = result in (_WAIT_OBJECT_0, _WAIT_ABANDONED)
                     abandoned = result == _WAIT_ABANDONED or self._initialization_abandoned
                 else:
@@ -634,7 +674,10 @@ def process_alive(pid, birth_int):
         if not handle:
             return ctypes.get_last_error() not in (87, 1168)
         try:
-            state = kernel.WaitForSingleObject(handle, 0)
+            # 进程探活只查询一次退出状态，不等待进程退出；Win64 必须保留 GIL，
+            # 否则即便传入零毫秒，返回 Python 时仍可能等待繁忙行情回调释放 GIL。
+            probe = getattr(kernel, "_immediate_wait", None) or kernel.WaitForSingleObject
+            state = probe(handle, 0)
             if state == _WAIT_OBJECT_0:
                 return False
             if state != _WAIT_TIMEOUT:

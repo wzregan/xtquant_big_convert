@@ -79,8 +79,10 @@ def _child(code, *arguments):
     """启动独立 Python 解释器重新 open 原语，避免继承父进程 mmap 或锁 fd。"""
     environment = dict(os.environ)
     environment["PYTHONPATH"] = str(SOURCE)
+    # Windows venv 启动器的 PID 可能不同于实际解释器；崩溃测试必须终止真正持锁的进程。
+    executable = getattr(sys, "_base_executable", sys.executable) if os.name == "nt" else sys.executable
     return subprocess.Popen(
-        [sys.executable, "-c", code] + [str(value) for value in arguments],
+        [executable, "-c", code] + [str(value) for value in arguments],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         universal_newlines=True, env=environment,
     )
@@ -111,6 +113,70 @@ def _read_line(child, timeout=5.0):
     reader = threading.Thread(target=read, daemon=True)
     reader.start()
     return result.get(timeout=timeout)
+
+
+@pytest.mark.skipif(os.name != "nt" or struct.calcsize("P") != 8, reason="需要真实 Win64 mutex 与 GIL")
+@pytest.mark.parametrize("legacy", [True, False])
+def test_mutex_wait_does_not_take_ownership_while_waiting_for_gil(resources, legacy):
+    """对照旧阻塞等待与新取锁方式，验证慢原生调用不会替尚未运行的线程占住 mutex。"""
+    name = resources.name("gil-mutex")
+    region = resources.region(name)
+    code = r'''
+import ctypes, sys, threading, time
+from bigqmt_signal_trader.transports import shm_primitives as p
+region = p.SharedRegion(sys.argv[1], 4096, sys.argv[2])
+sleep = ctypes.PyDLL("kernel32").Sleep
+sleep.argtypes = [ctypes.c_ulong]
+sleep.restype = None
+wait = p._wait_handle if sys.argv[3] == "1" else p._take_windows_mutex
+attempting = threading.Event()
+errors = []
+def consume():
+    """等待外部释放 mutex，然后立即归还，不运行任何业务逻辑。"""
+    attempting.set()
+    try:
+        status = wait(region._mutex, 2)
+        assert status in (0, 128), status
+        assert p._kernel32().ReleaseMutex(region._mutex)
+    except Exception as exc:
+        errors.append(str(exc))
+print("INITIALIZED", flush=True)
+assert sys.stdin.readline().strip() == "GO"
+thread = threading.Thread(target=consume)
+thread.start()
+assert attempting.wait(1)
+time.sleep(0.05)
+print("GIL_BUSY", flush=True)
+sleep(700)
+thread.join(3)
+assert not thread.is_alive() and not errors, errors
+region.close()
+print("DONE", flush=True)
+'''
+    environment = dict(os.environ, PYTHONPATH=str(SOURCE))
+    child = subprocess.Popen(
+        [sys.executable, "-c", code, name, resources.directory, str(int(legacy))],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        universal_newlines=True, env=environment,
+    )
+    try:
+        assert _read_line(child).strip() == "INITIALIZED"
+        with region.locked(1):
+            child.stdin.write("GO\n")
+            child.stdin.flush()
+            assert _read_line(child).strip() == "GIL_BUSY"
+            time.sleep(0.04)
+        time.sleep(0.04)
+        blocked = False
+        try:
+            with region.locked(0.12):
+                pass
+        except TransportTimeout:
+            blocked = True
+        assert blocked is legacy
+        assert "DONE" in _finish_child(child)
+    finally:
+        _stop_child(child)
 
 
 def test_name_preserves_scope_and_has_no_component_collision():
