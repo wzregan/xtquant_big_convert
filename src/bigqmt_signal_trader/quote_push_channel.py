@@ -88,10 +88,23 @@ class ZmqQuotePushChannel(QuotePushChannel):
         """返回服务端发布地址，供订阅诊断使用。"""
         return str(self.bind_address or "")
 
-    def __init__(self, bind_address=None, connect_address=None, context=None, print_prefix="[bigqmt_quote_push]"):
+    def __init__(self, bind_address=None, connect_address=None, context=None, print_prefix="[bigqmt_quote_push]",
+                 client_source_ports=None, client_source_lock_dir=None,
+                 client_source_connect_timeout_seconds=1.0):
+        """保存发布及订阅设置，context 由调用方持有且不会被本通道终止。
+
+        client_source_ports 为允许的整数源端口列表，空值沿用系统分配行为。
+        client_source_lock_dir 为本机进程共用的租约目录，租约由订阅线程持有到套接字关闭。
+        client_source_connect_timeout_seconds 为一次遍历端口池的总建连秒数。
+        """
+        from .transports.source_ports import normalize_source_ports
+
         self.bind_address = bind_address
         self.connect_address = connect_address
         self.print_prefix = print_prefix
+        self.client_source_ports = normalize_source_ports(client_source_ports)
+        self.client_source_lock_dir = client_source_lock_dir
+        self.client_source_connect_timeout_seconds = float(client_source_connect_timeout_seconds)
         self._zmq = None
         self._context = context
         self._pub = None
@@ -148,15 +161,23 @@ class ZmqQuotePushChannel(QuotePushChannel):
         zmq, ctx = self._ensure_context()
         if not self.connect_address:
             raise ValueError("connect_address is required to start a subscriber")
-        sub = ctx.socket(zmq.SUB)
+        from .transports.source_ports import connect_client_socket
+
+        def socket_factory():
+            """创建尚未交给订阅线程的套接字。"""
+            return ctx.socket(zmq.SUB)
+
+        sub, source_lease = connect_client_socket(
+            socket_factory, self.connect_address, self.client_source_ports,
+            self.client_source_lock_dir, self.client_source_connect_timeout_seconds,
+        )
         try:
-            sub.connect(self.connect_address)
             for topic in topics or []:
                 sub.setsockopt(zmq.SUBSCRIBE, str(topic).encode("utf-8"))
             self._sub = sub
             self._running = True
             self._sub_thread = threading.Thread(
-                target=self._sub_loop, args=(sub, on_msg), name="bigqmt-quote-push-sub", daemon=True
+                target=self._sub_loop, args=(sub, on_msg, source_lease), name="bigqmt-quote-push-sub", daemon=True
             )
             self._sub_thread.start()
         except Exception:
@@ -168,10 +189,12 @@ class ZmqQuotePushChannel(QuotePushChannel):
                 sub.close(linger=0)
             except Exception:
                 pass
+            if source_lease is not None:
+                source_lease.close()
             raise
 
-    def _sub_loop(self, sub, on_msg):
-        """逐帧解码并回调；单帧损坏不影响后续消息，套接字始终在本线程关闭。"""
+    def _sub_loop(self, sub, on_msg, source_lease=None):
+        """逐帧解码回调，并在本线程关闭套接字后释放对应的可选源端口租约。"""
         # 跨线程关闭 ZMQ 套接字可能触发 Windows signaler 断言并退出进程。
         try:
             poller = self._zmq.Poller()
@@ -208,6 +231,8 @@ class ZmqQuotePushChannel(QuotePushChannel):
                 sub.close(linger=0)
             except Exception:
                 pass
+            if source_lease is not None:
+                source_lease.close()
             if self._sub is sub:
                 self._sub = None
 

@@ -183,8 +183,16 @@ def _build_zmq_push(role, config, account_id, print_prefix):
     from ..quote_push_channel import ZmqQuotePushChannel
 
     field = "bind_address" if role == "server" else "connect_address"
-    return ZmqQuotePushChannel(print_prefix=print_prefix,
-                              **{field: zmq_push_address(role, config, account_id)})
+    settings = dict(config.get("zmq") or {})
+    source_options = {}
+    if role == "client":
+        source_options = {
+            "client_source_ports": settings.get("client_source_ports"),
+            "client_source_lock_dir": settings.get("client_source_lock_dir"),
+            "client_source_connect_timeout_seconds": settings.get("client_source_connect_timeout_seconds", 1.0),
+        }
+    source_options[field] = zmq_push_address(role, config, account_id)
+    return ZmqQuotePushChannel(print_prefix=print_prefix, **source_options)
 
 
 def _build_redis_push(role, config, account_id, print_prefix):

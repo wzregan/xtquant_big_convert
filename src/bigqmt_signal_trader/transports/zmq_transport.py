@@ -32,6 +32,7 @@ from ..redis_rpc import (
     encode_rpc_request_payload,
 )
 from .base import RpcTransport, TransportError, TransportTimeout
+from .source_ports import connect_client_socket, normalize_source_ports
 
 
 # ZMQ does not support ipc:// on Windows (it trips a signaler abort), so the
@@ -102,7 +103,16 @@ class ZmqTransport(RpcTransport):
         port_scan_range=50,
         stall_warn_seconds=20.0,
         stall_check_seconds=5.0,
+        client_source_ports=None,
+        client_source_lock_dir=None,
+        client_source_connect_timeout_seconds=1.0,
     ):
+        """保存延迟建连的 RPC 参数。
+
+        client_source_ports 为允许的整数源端口列表，空值沿用系统分配行为。
+        client_source_lock_dir 为本机客户端进程共用的租约目录；套接字关闭后释放租约。
+        client_source_connect_timeout_seconds 为一次遍历端口池的总建连秒数。
+        """
         super(ZmqTransport, self).__init__(account_id=account_id, print_prefix=print_prefix)
         # Address resolution order: explicit bind_address/connect_address win;
         # otherwise build tcp://host:port from host/port (port defaults to a
@@ -128,6 +138,9 @@ class ZmqTransport(RpcTransport):
         self.recv_timeout_seconds = float(recv_timeout_seconds)
         self.server_hwm = int(server_hwm)
         self.client_linger_ms = int(client_linger_ms)
+        self.client_source_ports = normalize_source_ports(client_source_ports)
+        self.client_source_lock_dir = client_source_lock_dir
+        self.client_source_connect_timeout_seconds = float(client_source_connect_timeout_seconds)
         # Discovery remains available for clients, but a server must bind the
         # configured address exactly. ``port_scan_range`` is retained only for
         # backward-compatible config loading and is intentionally not used.
@@ -178,11 +191,13 @@ class ZmqTransport(RpcTransport):
         # thread that asked. _client_lock now guards only the registry.
         self._dealer_local = threading.local()
         self._dealers = []          # [(thread, socket)] for shutdown + pruning
+        self._dealer_source_leases = {}
         self._client_lock = threading.Lock()
 
     # -- construction helper ----------------------------------------------
     @classmethod
     def from_config(cls, config, account_id="", print_prefix="[bigqmt_rpc]"):
+        """从 ZMQ 配置子字典创建延迟连接的实例，完整保留源端口池及租约设置。"""
         config = dict(config or {})
         return cls(
             bind_address=config.get("bind_address"),
@@ -203,6 +218,9 @@ class ZmqTransport(RpcTransport):
             port_scan_range=int(config.get("port_scan_range", 50)),
             stall_warn_seconds=float(config.get("stall_warn_seconds", 20.0)),
             stall_check_seconds=float(config.get("stall_check_seconds", 5.0)),
+            client_source_ports=config.get("client_source_ports"),
+            client_source_lock_dir=config.get("client_source_lock_dir"),
+            client_source_connect_timeout_seconds=float(config.get("client_source_connect_timeout_seconds", 1.0)),
         )
 
     # -- shared zmq context -----------------------------------------------
@@ -590,13 +608,9 @@ class ZmqTransport(RpcTransport):
         return text or None
 
     def _reap_dead_dealers(self):
-        """Close sockets whose owning thread has exited. Caller holds the lock.
+        """在持有客户端锁时回收已退出线程的套接字和租约，避免短命线程耗尽端口池。
 
-        Without this a caller that spawns a thread per request would leak one
-        socket -- and one TCP connection to the ROUTER -- per thread until
-        stop(). The owner is gone by definition here, so nobody can be inside
-        a send or recv on it; that is what makes closing it from this thread
-        safe, unlike the router socket (see stop()).
+        原线程已退出，因此不会与其收发操作竞争；运行中线程的套接字不能在此关闭。
         """
         alive = []
         for owner, sock in self._dealers:
@@ -607,32 +621,53 @@ class ZmqTransport(RpcTransport):
                 sock.close(linger=0)
             except Exception:
                 pass
+            lease = self._dealer_source_leases.pop(sock, None)
+            if lease is not None:
+                lease.close()
         self._dealers = alive
 
-    def _ensure_dealer(self):
-        """首次使用或停止后重新使用时，为当前线程创建独占的 DEALER。"""
+    def _ensure_dealer(self, timeout_seconds=None):
+        """为当前线程创建独占 DEALER；固定源端口的建连预算不超过本次请求余量。"""
         sock = getattr(self._dealer_local, "sock", None)
         if sock is not None and not sock.closed:
             return sock
         zmq, ctx = self._ensure_zmq()
         address = self._resolve_connect_address()
-        sock = ctx.socket(zmq.DEALER)
-        # Unique identity so ROUTER can route replies back to us.
-        sock.setsockopt(zmq.IDENTITY, uuid.uuid4().hex.encode("utf-8")[:16])
-        sock.setsockopt(zmq.LINGER, self.client_linger_ms)
-        sock.connect(address)
+        if self.client_source_ports:
+            # 端口池可能全部被已退出线程占用，申请新租约前必须先回收这些句柄。
+            with self._client_lock:
+                self._reap_dead_dealers()
+
+        def socket_factory():
+            """在调用线程创建带独立路由身份的客户端套接字。"""
+            sock = ctx.socket(zmq.DEALER)
+            sock.setsockopt(zmq.IDENTITY, uuid.uuid4().hex.encode("utf-8")[:16])
+            sock.setsockopt(zmq.LINGER, self.client_linger_ms)
+            return sock
+
+        connect_timeout = self.client_source_connect_timeout_seconds
+        if timeout_seconds is not None:
+            connect_timeout = min(connect_timeout, float(timeout_seconds))
+        sock, lease = connect_client_socket(
+            socket_factory, address, self.client_source_ports,
+            self.client_source_lock_dir, connect_timeout,
+        )
         self._dealer_local.sock = sock
         with self._client_lock:
             self._reap_dead_dealers()
             self._dealers.append((threading.current_thread(), sock))
+            if lease is not None:
+                self._dealer_source_leases[sock] = lease
             self.connect_address = address
         return sock
 
     def send_request(self, request, timeout_seconds, **_kwargs):
+        """在同一请求预算内建立连接、发送请求并匹配关联响应。"""
         # No lock around the round trip: this socket belongs to this thread
         # and no other thread touches it (#186).
         zmq = self._zmq or self._ensure_zmq()[0]
-        dealer = self._ensure_dealer()
+        started = time.monotonic()
+        dealer = self._ensure_dealer(timeout_seconds=timeout_seconds)
         request = dict(request)
         request.setdefault("request_id", uuid.uuid4().hex)
         request_id = request["request_id"]
@@ -641,7 +676,7 @@ class ZmqTransport(RpcTransport):
             dealer.send(payload.encode("utf-8"))
         except Exception as exc:
             raise TransportError("zmq send failed: %s" % exc)
-        deadline = time.time() + float(timeout_seconds)
+        deadline = time.time() + max(0.0, float(timeout_seconds) - (time.monotonic() - started))
         poller = zmq.Poller()
         poller.register(dealer, zmq.POLLIN)
         while True:
@@ -686,6 +721,9 @@ class ZmqTransport(RpcTransport):
                     sock.close(linger=self.client_linger_ms)
                 except Exception:
                     pass
+                lease = self._dealer_source_leases.pop(sock, None)
+                if lease is not None:
+                    lease.close()
             self._dealers = []
         # 清理本线程引用；其他线程下次获取时会检查 closed 状态并重新建连。
         if getattr(self._dealer_local, "sock", None) is not None:
