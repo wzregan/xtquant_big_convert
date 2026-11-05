@@ -283,7 +283,8 @@ class FakeClient:
     def _redis(self):
         return None
 
-    def call(self, method, params=None, account_id=None, timeout_seconds=None):
+    def call(self, method, params=None, account_id=None, timeout_seconds=None, use_formula=True):
+        """按当前 RPC 签名模拟行情响应；use_formula 表示是否允许公式侧缓存。"""
         self.calls.append(method)
         self.call_params.append((method, params))
         self.call_timeouts.append((method, timeout_seconds))
@@ -408,7 +409,8 @@ class CompatReadMatrixTest(unittest.TestCase):
         def _redis(self):
             return None
 
-        def call(self, method, params=None, account_id=None, timeout_seconds=None):
+        def call(self, method, params=None, account_id=None, timeout_seconds=None, use_formula=True):
+            """按当前 RPC 签名模拟行情响应；use_formula 表示是否允许公式侧缓存。"""
             import pandas as pd
 
             params = dict(params or {})
@@ -576,10 +578,12 @@ class AdjustedDownloadTest(unittest.TestCase):
         xt = self._xt()
         original_call = xt.client.call
 
-        def failing_download(method, params=None, account_id=None, timeout_seconds=None):
+        def failing_download(method, params=None, account_id=None, timeout_seconds=None, use_formula=True):
+            """模拟下载接口失败，同时保留显式只读请求的公式选项。"""
             if method == "download_history_data2":
                 raise RuntimeError("global not available")
-            return original_call(method, params, account_id=account_id, timeout_seconds=timeout_seconds)
+            return original_call(method, params, account_id=account_id, timeout_seconds=timeout_seconds,
+                                 use_formula=use_formula)
 
         xt.client.call = failing_download
         result = xt.download_history_data2(["600000.SH"], "1d", dividend_type="none")
@@ -593,10 +597,12 @@ class AdjustedDownloadTest(unittest.TestCase):
         xt = self._xt()
         original_call = xt.client.call
 
-        def failing_download(method, params=None, account_id=None, timeout_seconds=None):
+        def failing_download(method, params=None, account_id=None, timeout_seconds=None, use_formula=True):
+            """模拟下载接口失败，同时保留显式只读请求的公式选项。"""
             if method == "download_history_data2":
                 raise RuntimeError("global not available")
-            return original_call(method, params, account_id=account_id, timeout_seconds=timeout_seconds)
+            return original_call(method, params, account_id=account_id, timeout_seconds=timeout_seconds,
+                                 use_formula=use_formula)
 
         xt.client.call = failing_download
         result = xt.download_history_data2(["600000.SH"], "1d", dividend_type="front")
@@ -639,10 +645,12 @@ class AdjustedDownloadTest(unittest.TestCase):
         seen = []
         original_call = xt.client.call
 
-        def failing_download(method, params=None, account_id=None, timeout_seconds=None):
+        def failing_download(method, params=None, account_id=None, timeout_seconds=None, use_formula=True):
+            """模拟下载接口失败，同时保留显式只读请求的公式选项。"""
             if method == "download_history_data2":
                 raise RuntimeError("global not available")
-            return original_call(method, params, account_id=account_id, timeout_seconds=timeout_seconds)
+            return original_call(method, params, account_id=account_id, timeout_seconds=timeout_seconds,
+                                 use_formula=use_formula)
 
         xt.client.call = failing_download
         with self.assertRaisesRegex(RuntimeError, "global not available"):
@@ -679,7 +687,8 @@ class _AllZeroThenRealClient(FakeClient):
         super(_AllZeroThenRealClient, self).__init__(cache_dir)
         self._downloaded = False
 
-    def call(self, method, params=None, account_id=None, timeout_seconds=None):
+    def call(self, method, params=None, account_id=None, timeout_seconds=None, use_formula=True):
+        """按当前 RPC 签名模拟行情响应；use_formula 表示是否允许公式侧缓存。"""
         self.calls.append(method)
         self.call_params.append((method, params))
         self.call_timeouts.append((method, timeout_seconds))
@@ -706,7 +715,8 @@ class _MissingThenCompleteClient(FakeClient):
         super(_MissingThenCompleteClient, self).__init__(cache_dir)
         self._downloaded = False
 
-    def call(self, method, params=None, account_id=None, timeout_seconds=None):
+    def call(self, method, params=None, account_id=None, timeout_seconds=None, use_formula=True):
+        """按当前 RPC 签名模拟行情响应；use_formula 表示是否允许公式侧缓存。"""
         self.calls.append(method)
         self.call_params.append((method, params))
         import pandas as pd
@@ -730,7 +740,8 @@ class _NeverServesAllClient(FakeClient):
         super(_NeverServesAllClient, self).__init__(cache_dir)
         self._unserved = set(unserved)
 
-    def call(self, method, params=None, account_id=None, timeout_seconds=None):
+    def call(self, method, params=None, account_id=None, timeout_seconds=None, use_formula=True):
+        """按当前 RPC 签名模拟行情响应；use_formula 表示是否允许公式侧缓存。"""
         self.calls.append(method)
         self.call_params.append((method, params))
         self.call_timeouts.append((method, timeout_seconds))
@@ -749,7 +760,8 @@ class _FieldKeyedClient(FakeClient):
     """get_market_data answers field-keyed ({field: {code: [..]}}), the QMT
     ContextInfo shape -- served codes live one level below the top keys."""
 
-    def call(self, method, params=None, account_id=None, timeout_seconds=None):
+    def call(self, method, params=None, account_id=None, timeout_seconds=None, use_formula=True):
+        """按当前 RPC 签名模拟行情响应；use_formula 表示是否允许公式侧缓存。"""
         self.calls.append(method)
         self.call_params.append((method, params))
         self.call_timeouts.append((method, timeout_seconds))
@@ -886,7 +898,8 @@ class _AsyncLandingClient(FakeClient):
         self._empty_left = empty_reads
         self.pull_count = 0
 
-    def call(self, method, params=None, account_id=None, timeout_seconds=None):
+    def call(self, method, params=None, account_id=None, timeout_seconds=None, use_formula=True):
+        """按当前 RPC 签名模拟行情响应；use_formula 表示是否允许公式侧缓存。"""
         if method == "get_market_data_ex":
             self.pull_count += 1
             if self._empty_left > 0:
@@ -894,7 +907,8 @@ class _AsyncLandingClient(FakeClient):
                 self.calls.append(method)
                 self.call_params.append((method, params))
                 return {}
-        return super().call(method, params, account_id=account_id, timeout_seconds=timeout_seconds)
+        return super().call(method, params, account_id=account_id, timeout_seconds=timeout_seconds,
+                            use_formula=use_formula)
 
 
 class DownloadWaitForDataTest(unittest.TestCase):

@@ -2236,7 +2236,7 @@ class BigQmtXtData:
         return self._call(method, **params)
 
     def _pull_and_cache(self, codes, period, start_time, end_time, count, dividend_type="none"):
-        """Fetch codes over RPC (get_market_data_ex already caches them)."""
+        """只读终端已有历史并填充客户端缓存，不建立隐式行情订阅。"""
         data = self.get_market_data_ex(
             field_list=DEFAULT_DOWNLOAD_FIELDS,
             stock_list=list(codes),
@@ -2245,6 +2245,9 @@ class BigQmtXtData:
             end_time=end_time,
             count=count,
             dividend_type=dividend_type,
+            use_formula=False,
+            backfill_pre_close=False,
+            subscribe=False,
         )
         out = {}
         for code in codes:
@@ -2558,6 +2561,11 @@ class BigQmtXtData:
                     dividend_type=dividend_type,
                     fill_data=False,  # fill 会用全 0 占位行冒充数据，轮询判定必须关掉
                     timeout_seconds=float(data_wait_seconds),
+                    # 下载后的缓存回填仍属于历史读取；默认订阅会逐证券消耗终端
+                    # 配额，使后续分钟查询在盘中失去更新。复权准备已由下载阶段负责。
+                    use_formula=False,
+                    backfill_pre_close=False,
+                    subscribe=False,
                 )
                 ready = 0
                 for code in batch:
