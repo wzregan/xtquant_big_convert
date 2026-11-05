@@ -7,6 +7,7 @@ import os
 import re
 import threading
 
+from .code_utils import instrument_code_flags
 
 ETF_SECTORS = {
     "ETF跨境型": "T0", "ETF债券型": "T0", "ETF商品型": "T0",
@@ -108,7 +109,7 @@ def normalize_instrument_detail(code, raw):
     code = str(code).strip().upper()
     is_etf = (
         code.endswith((".SH", ".SZ"))
-        and (code.startswith(("15", "16", "50", "51", "52", "56", "58"))
+        and (instrument_code_flags(code)["fund"]
              or "ETF" in str(raw.get("ProductID", "")).upper())
     )
     if not is_etf:

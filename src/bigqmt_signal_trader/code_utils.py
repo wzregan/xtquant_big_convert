@@ -5,6 +5,16 @@ import re
 
 _DIGIT_CODE_RE = re.compile(r"^\d{6}$")
 
+_STOCK_CODE_PREFIXES = {
+    "SH": ("600", "601", "603", "605", "688", "689"),
+    "SZ": ("000", "001", "002", "003", "300", "301"),
+    "BJ": ("4", "8", "9"),
+}
+_FUND_CODE_PREFIXES = {
+    "SH": ("50", "51", "52", "53", "55", "56", "58"),
+    "SZ": ("15", "16"),
+}
+
 # Tokens that name a whole exchange rather than one instrument.
 #
 # Stock markets are what get_markets() reports, so they stay their own set.
@@ -104,6 +114,28 @@ def normalize_stock_code(code):
             market = "SZ"
         return f"{text}.{market}"
     raise ValueError(f"invalid stock code: {code}")
+
+
+def instrument_code_flags(stock_code):
+    """按证券代码和交易所生成本地分类，不查询行情或分类数据源。
+
+    参数：
+        stock_code：支持带交易所后缀、SH/SZ 前缀或六位裸代码。
+    """
+    normalized = normalize_stock_code(stock_code)
+    pure, _, market = normalized.partition(".")
+    result = dict.fromkeys(("stock", "fund", "etf", "bond", "index"), False)
+    if not _DIGIT_CODE_RE.match(pure):
+        return result
+    # 000 在沪市是指数、在深市是股票；不能仅凭数字前缀同时标记两种类型。
+    result["stock"] = pure.startswith(_STOCK_CODE_PREFIXES.get(market, ()))
+    result["fund"] = pure.startswith(_FUND_CODE_PREFIXES.get(market, ()))
+    result["etf"] = result["fund"] and not pure.startswith(("16", "50"))
+    result["bond"] = market in ("SH", "SZ") and pure.startswith(("11", "12"))
+    result["index"] = (market == "SH" and pure.startswith("000")) or (
+        market == "SZ" and pure.startswith("399")
+    )
+    return result
 
 
 def min_lot(stock_code):

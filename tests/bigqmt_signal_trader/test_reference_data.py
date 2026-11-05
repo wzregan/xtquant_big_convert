@@ -79,6 +79,20 @@ def test_details_keep_evidence_and_fail_closed_when_file_disappears(tmp_path, mo
     assert normalize_instrument_detail("510300.SH", {}) == {}
 
 
+@pytest.mark.parametrize("code", ["520600.SH", "530000.SH", "551000.SH"])
+def test_new_etf_prefixes_receive_configured_reference(code, tmp_path, monkeypatch):
+    """基金类型与参考证据使用同一代码分类，不能遗漏 52、53、55 号段。"""
+    value = document()
+    value["sectors"]["ETF股票型"].append(code)
+    value["sha256"] = reference_digest(value)
+    path = tmp_path / "etf.json"
+    path.write_text(json.dumps(value), encoding="utf-8")
+    monkeypatch.setenv("BIGQMT_ETF_REFERENCE_FILE", str(path))
+    result = normalize_instrument_detail(code, {"PriceTick": 0.001, "InstrumentStatus": 0})
+    assert result["SettlementCycle"] == "T1"
+    assert result["SettlementSource"].startswith("native-xtquant:")
+
+
 @pytest.mark.parametrize("value", [0, "19700101", "20260230", "", None])
 def test_invalid_open_dates_are_not_exposed_as_real_listing_dates(value, monkeypatch):
     """非法日期保留原值和质量标记，正常日期保持不变。"""

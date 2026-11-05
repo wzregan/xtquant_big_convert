@@ -30,7 +30,7 @@ import importlib
 import time
 
 from ..code_utils import (
-    EXCHANGE_TOKENS, FUTURES_MARKET_CODES, normalize_stock_code)
+    EXCHANGE_TOKENS, FUTURES_MARKET_CODES, instrument_code_flags, normalize_stock_code)
 from ..logging_setup import get_logger
 from ..quote_utils import find_code_payload, is_option_code, latest_quote_row
 from ..reference_data import normalize_instrument_detail
@@ -742,17 +742,15 @@ class BigQmtMarketDataProvider:
         return normalize_instrument_detail(normalized, data or {})
 
     def get_instrument_type(self, code, variety_list=None):
+        """优先使用原生分类，缺少接口时按交易所与代码统一判断。
+
+        参数：
+            code：证券代码。
+            variety_list：仅返回指定分类键；未指定时返回全部分类。
+        """
         if hasattr(self.context_info, "get_instrument_type"):
             return self.context_info.get_instrument_type(code, variety_list)
-        normalized = normalize_stock_code(code)
-        pure = normalized.split(".")[0]
-        result = {
-            "stock": pure.startswith(("000", "001", "002", "003", "300", "301", "600", "601", "603", "605", "688", "689")),
-            "fund": pure.startswith(("15", "16", "50", "51", "56", "58")),
-            "etf": pure.startswith(("15", "51", "56", "58")),
-            "bond": pure.startswith(("11", "12")),
-            "index": pure.startswith(("000", "399")) and not normalized.startswith(("000001.SZ", "000002.SZ")),
-        }
+        result = instrument_code_flags(code)
         if variety_list:
             return {str(name): bool(result.get(str(name), False)) for name in variety_list}
         return result
