@@ -103,14 +103,18 @@ def connect_client_socket(socket_factory, endpoint, ports=None, lock_dir=None, t
 
     deadline = time.monotonic() + timeout
     last_error = "all configured ports are leased"
-    for port in ports:
+    leased_count = 0
+    attempted_count = 0
+    for index, port in enumerate(ports):
         if time.monotonic() >= deadline:
             break
         if port == int(destination):
             continue
         lease = SourcePortLease.try_acquire(port, lock_dir)
         if lease is None:
+            leased_count += 1
             continue
+        attempted_count += 1
         socket = monitor = None
         connected = False
         try:
@@ -119,7 +123,12 @@ def connect_client_socket(socket_factory, endpoint, ports=None, lock_dir=None, t
             monitor = socket.get_monitor_socket(events=events)
             address = "tcp://127.0.0.1:%s;127.0.0.1:%s" % (port, destination)
             socket.connect(address)
-            attempt_deadline = min(deadline, time.monotonic() + 0.2)
+            # 总预算必须覆盖池尾部：Windows 上库外占用或待回收的端口可能只发出
+            # CONNECT_RETRIED，若每个候选固定等待 200ms，前几个失败就会饿死空闲端口。
+            # 按剩余候选均分余量，并保留单候选上限，既不延长请求预算也不扩大端口范围。
+            now = time.monotonic()
+            candidate_budget = min(0.2, max(0.0, deadline - now) / (len(ports) - index))
+            attempt_deadline = now + candidate_budget
             while time.monotonic() < attempt_deadline:
                 remaining = attempt_deadline - time.monotonic()
                 if not monitor.poll(max(1, int(remaining * 1000))):
@@ -129,7 +138,10 @@ def connect_client_socket(socket_factory, endpoint, ports=None, lock_dir=None, t
                     connected = True
                     return socket, lease
                 last_error = "source port %s could not connect (event=%s)" % (port, event["event"])
-                break
+                # CONNECT_RETRIED 表示 ZMQ 已安排重试，不是端口绑定的终态失败。
+                # 保留同一套接字等待本候选剩余预算，避免把瞬时重连直接升级为断流。
+                if event["event"] == zmq.EVENT_BIND_FAILED:
+                    break
             else:
                 last_error = "source port %s connection did not complete" % port
         finally:
@@ -145,4 +157,7 @@ def connect_client_socket(socket_factory, endpoint, ports=None, lock_dir=None, t
                 if socket is not None:
                     socket.close(linger=0)
                 lease.close()
-    raise SourcePortUnavailable("no configured source port connected: %s" % last_error)
+    raise SourcePortUnavailable(
+        "no configured source port connected to %s (leased=%s, attempted=%s): %s"
+        % (endpoint, leased_count, attempted_count, last_error)
+    )

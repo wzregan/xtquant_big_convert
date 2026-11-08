@@ -1,5 +1,6 @@
 """验证固定源端口的跨线程、跨进程租约与真实 TCP 收发，不连接 QMT。"""
 
+import errno
 import json
 import os
 from pathlib import Path
@@ -9,8 +10,9 @@ import sys
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import zmq
 
@@ -19,6 +21,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from bigqmt_signal_trader.redis_rpc import decode_rpc_request_payload, encode_rpc_request_payload
 from bigqmt_signal_trader.transports.backend import get_backend
+from bigqmt_signal_trader.transports import source_ports
 from bigqmt_signal_trader.transports.source_ports import (
     SourcePortLease, SourcePortUnavailable, connect_client_socket, normalize_source_ports,
 )
@@ -113,6 +116,62 @@ class SourcePortsTests(unittest.TestCase):
         finally:
             lease.close()
 
+    def test_busy_prefix_cannot_starve_available_tail_port(self):
+        """多个库外占用候选不能耗尽预算，使池尾部空闲端口永远得不到尝试。"""
+        occupied = []
+        try:
+            for _ in range(7):
+                item = socket.socket()
+                if os.name == "nt":
+                    item.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                item.bind(("127.0.0.1", 0))
+                item.listen(1)
+                occupied.append(item)
+            tail = available_ports(1)[0]
+            started = time.monotonic()
+            _, lease = self.connect([item.getsockname()[1] for item in occupied] + [tail], timeout=0.9)
+            accepted, address = self.listener.accept()
+            accepted.close()
+            self.assertEqual(address[1], tail)
+            self.assertEqual(lease.port, tail)
+            self.assertLess(time.monotonic() - started, 1.4)
+            for item in occupied:
+                released = SourcePortLease.try_acquire(item.getsockname()[1], self.directory.name)
+                self.assertIsNotNone(released)
+                released.close()
+        finally:
+            for item in occupied:
+                item.close()
+
+    def test_retry_only_candidates_share_the_total_budget(self):
+        """模拟仅发重试事件的 Windows 端口冲突，确定总预算仍能走到最后一个候选。"""
+        from unittest.mock import Mock
+
+        ports = available_ports(8)
+        elapsed = [0.0]
+        sockets = []
+
+        def poll_retry(milliseconds):
+            """用虚拟时钟消耗候选余量，避免测试依赖操作系统的绑定事件差异。"""
+            elapsed[0] += milliseconds / 1000.0
+            return False
+
+        for _ in ports[:-1]:
+            item = Mock()
+            item.get_monitor_socket.return_value.poll.side_effect = poll_retry
+            sockets.append(item)
+        tail = Mock()
+        tail.get_monitor_socket.return_value.poll.return_value = True
+        sockets.append(tail)
+        with patch("bigqmt_signal_trader.transports.source_ports.time.monotonic", side_effect=lambda: elapsed[0]), \
+                patch("zmq.utils.monitor.recv_monitor_message", return_value={"event": zmq.EVENT_CONNECTED}), \
+                patch.object(self, "factory", side_effect=sockets) as factory:
+            connected, lease = self.connect(ports, timeout=0.9)
+        self.assertIs(connected, tail)
+        self.assertEqual(factory.call_count, len(ports))
+        self.assertEqual(lease.port, ports[-1])
+        self.assertLess(elapsed[0], 0.9)
+
     def test_connection_failure_respects_budget_and_releases_lease(self):
         """总建连预算到期后，失败尝试不得残留端口租约。"""
         destination, source = available_ports(2)
@@ -123,6 +182,169 @@ class SourcePortsTests(unittest.TestCase):
         lease = SourcePortLease.try_acquire(source, self.directory.name)
         self.assertIsNotNone(lease)
         lease.close()
+
+    def test_retry_notification_can_be_followed_by_connection(self):
+        """ZMQ 通知瞬时重试后真实连接成功时，不能提前放弃唯一候选端口。"""
+        from unittest.mock import Mock
+
+        port = available_ports(1)[0]
+        monitor = Mock()
+        monitor.poll.return_value = True
+        item = Mock()
+        item.get_monitor_socket.return_value = monitor
+        with patch("zmq.utils.monitor.recv_monitor_message", side_effect=[
+            {"event": zmq.EVENT_CONNECT_RETRIED}, {"event": zmq.EVENT_CONNECTED},
+        ]), patch.object(self, "factory", return_value=item):
+            connected, lease = self.connect([port])
+        self.assertIs(connected, item)
+        self.assertEqual(lease.port, port)
+        self.assertEqual(monitor.poll.call_count, 2)
+
+    def test_connection_failure_identifies_destination_and_pool_usage(self):
+        """故障须能区分错误目标地址和端口占用，避免只记录最后一个候选端口。"""
+        destination, source = available_ports(2)
+        endpoint = "tcp://127.0.0.1:%s" % destination
+        with self.assertRaises(SourcePortUnavailable) as captured:
+            self.connect([source], endpoint=endpoint, timeout=0.05)
+        self.assertIn(endpoint, str(captured.exception))
+        self.assertIn("leased=0, attempted=1", str(captured.exception))
+
+    def test_bind_failure_releases_candidate_and_tries_next_port(self):
+        """绑定失败属于当前候选终态，须释放其租约并直接尝试后续允许端口。"""
+        first_port, next_port = available_ports(2)
+        first, following = Mock(), Mock()
+        for item in (first, following):
+            item.get_monitor_socket.return_value.poll.return_value = True
+        with patch.object(self, "factory", side_effect=[first, following]), patch(
+            "zmq.utils.monitor.recv_monitor_message",
+            side_effect=[{"event": zmq.EVENT_BIND_FAILED}, {"event": zmq.EVENT_CONNECTED}],
+        ):
+            connected, lease = self.connect([first_port, next_port])
+        self.assertIs(connected, following)
+        self.assertEqual(lease.port, next_port)
+        first.get_monitor_socket.return_value.poll.assert_called_once()
+        first.close.assert_called_once_with(linger=0)
+        following.close.assert_not_called()
+        released = SourcePortLease.try_acquire(first_port, self.directory.name)
+        self.assertIsNotNone(released)
+        released.close()
+        self.assertIsNone(SourcePortLease.try_acquire(next_port, self.directory.name))
+
+    def test_candidate_setup_failure_always_releases_its_lease(self):
+        """创建套接字或监测器失败仍归还租约，并只关闭已经创建的资源。"""
+        for stage in ("socket", "monitor"):
+            with self.subTest(stage=stage):
+                port = available_ports(1)[0]
+                item = Mock()
+                if stage == "monitor":
+                    item.get_monitor_socket.side_effect = RuntimeError("monitor failed")
+                with patch.object(
+                    self, "factory", return_value=item,
+                    side_effect=RuntimeError("socket failed") if stage == "socket" else None,
+                ), self.assertRaisesRegex(RuntimeError, stage + " failed"):
+                    self.connect([port])
+                item.disable_monitor.assert_not_called()
+                if stage == "monitor":
+                    item.close.assert_called_once_with(linger=0)
+                else:
+                    item.close.assert_not_called()
+                released = SourcePortLease.try_acquire(port, self.directory.name)
+                self.assertIsNotNone(released)
+                released.close()
+
+    def test_monitor_shutdown_error_does_not_leak_failed_candidate(self):
+        """上下文关闭使停用监测器报错时，仍必须关闭两端资源并归还租约。"""
+        port = available_ports(1)[0]
+        item = Mock()
+        item.get_monitor_socket.return_value.poll.return_value = True
+        item.disable_monitor.side_effect = zmq.ZMQError(zmq.ETERM)
+        with patch.object(self, "factory", return_value=item), patch(
+            "zmq.utils.monitor.recv_monitor_message", return_value={"event": zmq.EVENT_BIND_FAILED},
+        ), self.assertRaises(SourcePortUnavailable):
+            self.connect([port])
+        item.get_monitor_socket.return_value.close.assert_called_once_with(linger=0)
+        item.close.assert_called_once_with(linger=0)
+        released = SourcePortLease.try_acquire(port, self.directory.name)
+        self.assertIsNotNone(released)
+        released.close()
+
+    def test_expired_budget_does_not_acquire_or_connect(self):
+        """遍历前总预算已耗尽时，不再租用端口或创建新连接。"""
+        with patch.object(source_ports.time, "monotonic", side_effect=[0.0, 1.0]), patch.object(
+            SourcePortLease, "try_acquire",
+        ) as acquire, patch.object(self, "factory") as factory:
+            with self.assertRaises(SourcePortUnavailable):
+                self.connect([50060], timeout=1.0)
+        acquire.assert_not_called()
+        factory.assert_not_called()
+
+    def test_destination_port_is_never_used_as_source(self):
+        """目标监听端口即使出现在候选池中，也不能被尝试绑定为客户端源端口。"""
+        with patch.object(SourcePortLease, "try_acquire") as acquire, patch.object(
+            self, "factory",
+        ) as factory, self.assertRaises(SourcePortUnavailable):
+            self.connect([self.listener.getsockname()[1]])
+        acquire.assert_not_called()
+        factory.assert_not_called()
+
+    def test_invalid_timeout_is_rejected_before_connecting(self):
+        """拒绝零、负数及非有限总预算，避免无限等待或向下游传递非法时间。"""
+        for timeout in (0, -1, float("nan"), float("inf")):
+            with self.subTest(timeout=timeout), patch.object(self, "factory") as factory:
+                with self.assertRaises(ValueError):
+                    self.connect([50060], timeout=timeout)
+                factory.assert_not_called()
+
+    def test_default_connection_failure_closes_socket(self):
+        """未启用固定端口时，建连失败也必须关闭调用方刚创建的套接字。"""
+        item = Mock()
+        item.connect.side_effect = RuntimeError("connect failed")
+        with patch.object(self, "factory", return_value=item), self.assertRaisesRegex(
+            RuntimeError, "connect failed",
+        ):
+            self.connect(None)
+        item.close.assert_called_once_with(linger=0)
+
+    def test_normalization_removes_duplicates_and_limits_pool_size(self):
+        """重复候选只保留首次出现顺序，超长端口池必须在建连前拒绝。"""
+        self.assertEqual(normalize_source_ports([50061, 50060, 50061]), (50061, 50060))
+        with self.assertRaises(ValueError):
+            normalize_source_ports([50060] * 257)
+
+    def test_windows_lease_uses_nonblocking_lock_and_closes_once(self):
+        """在任意测试平台验证 Windows 非阻塞文件锁契约及幂等释放。"""
+        locking = Mock()
+        fake_msvcrt = SimpleNamespace(locking=locking, LK_NBLCK=2)
+        with patch.object(source_ports, "os", SimpleNamespace(name="nt", SEEK_END=os.SEEK_END)), patch.dict(
+            sys.modules, {"msvcrt": fake_msvcrt},
+        ):
+            lease = SourcePortLease.try_acquire(50060, self.directory.name)
+        handle = lease._handle
+        locking.assert_called_once_with(handle.fileno(), fake_msvcrt.LK_NBLCK, 1)
+        lease.close()
+        lease.close()
+        self.assertTrue(handle.closed)
+
+    def test_lease_errors_release_handle_and_preserve_failure(self):
+        """锁冲突返回无租约；其他系统异常和中断原样传播，且不能泄漏文件句柄。"""
+        failures = (OSError(errno.EAGAIN, "busy"), OSError(errno.EIO, "disk"), KeyboardInterrupt())
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                handle = Mock()
+                handle.seek.return_value = 1
+                directory = Mock()
+                directory.__truediv__ = Mock(return_value=Mock(open=Mock(return_value=handle)))
+                fake_msvcrt = SimpleNamespace(locking=Mock(side_effect=failure), LK_NBLCK=2)
+                with patch.object(source_ports, "Path", return_value=directory), patch.object(
+                    source_ports, "os", SimpleNamespace(name="nt", SEEK_END=os.SEEK_END),
+                ), patch.dict(sys.modules, {"msvcrt": fake_msvcrt}):
+                    if isinstance(failure, OSError) and failure.errno == errno.EAGAIN:
+                        self.assertIsNone(SourcePortLease.try_acquire(50060, self.directory.name))
+                    else:
+                        with self.assertRaises(type(failure)) as captured:
+                            SourcePortLease.try_acquire(50060, self.directory.name)
+                        self.assertIs(captured.exception, failure)
+                handle.close.assert_called_once_with()
 
     def test_default_configuration_does_not_create_a_port_lease(self):
         """未启用源端口池时保持原连接路径，不访问租约目录。"""
