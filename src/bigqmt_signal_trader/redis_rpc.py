@@ -1473,14 +1473,38 @@ class BigQmtRpcHandlers:
             "get_new_purchase_limit", self._request_account_id(params))
 
     def _handle_get_history_trade_detail_data(self, params):
+        """按账户类型和闭区间日期读取历史明细，保留日期分组并透传查询失败。"""
         account_id = self._request_account_id(params)
-        detail_type = str(params.get("detail_type") or params.get("datatype") or "DEAL")
-        start_date = str(params.get("start_date") or params.get("start_time") or "")
-        end_date = str(params.get("end_date") or params.get("end_time") or "")
-        result = self._call_qmt_global(
-            "get_history_trade_detail_data", account_id, detail_type, start_date, end_date
-        )
-        return result
+        detail_type = str(params.get("detail_type") or "DEAL").upper()
+        if detail_type not in {"POSITION", "ORDER", "DEAL"}:
+            raise ValueError("historical detail_type must be POSITION, ORDER or DEAL")
+        dates = []
+        for key in ("start_date", "end_date"):
+            value = params.get(key)
+            if not isinstance(value, str) or len(value) != 8 or not value.isdigit():
+                raise ValueError("%s must use YYYYMMDD" % key)
+            dates.append(_dt.datetime.strptime(value, "%Y%m%d").date())
+        if dates[0] > dates[1]:
+            raise ValueError("start_date must not exceed end_date")
+        func = self.qmt_api.get("get_history_trade_detail_data")
+        if not callable(func):
+            raise NotImplementedError("get_history_trade_detail_data is not available")
+        # 官方接口有五个参数；调用失败和缺少绑定都不能冒充“历史中没有委托/成交”。
+        result = func(account_id, self._configured_account_type(account_id), detail_type,
+                      params["start_date"], params["end_date"])
+        if not isinstance(result, (list, tuple)):
+            raise ValueError("historical detail result must be a sequence of date groups")
+        for group in result:
+            if (not isinstance(group, (list, tuple)) or len(group) != 2
+                    or not isinstance(group[1], (list, tuple))):
+                raise ValueError("historical detail group must contain timetag and records")
+            timetag = group[0]
+            if (isinstance(timetag, bool)
+                    or not isinstance(timetag, (str, int, float))
+                    or (isinstance(timetag, (int, float)) and not math.isfinite(timetag))):
+                raise ValueError("historical detail timetag is invalid")
+        # 历史返回的是日期与明细列表的二元组，不能按普通持仓行展开而丢掉分组内容。
+        return _normalize_mapping_value(result)
 
     def _handle_get_assure_contract(self, params):
         return self._call_qmt_global("get_assure_contract", self._request_account_id(params))

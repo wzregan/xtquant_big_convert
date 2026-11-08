@@ -319,7 +319,7 @@
 | `get_last_order_id` | `account_id`(可选) | 最近委托号 |
 | `get_ipo_data` | `account_id`(可选) | 新股数据 |
 | `get_new_purchase_limit` | `account_id`(可选) | 新股申购额度 |
-| `get_history_trade_detail_data` | `account_id`(可选) `detail_type`("DEAL"/"ORDER") `start_date` `end_date` | 历史成交明细 |
+| `get_history_trade_detail_data` | `account_id`(可选) `detail_type`("POSITION"/"ORDER"/"DEAL") `start_date` `end_date`（均为YYYYMMDD） | 历史明细；返回`[[timetag, [记录...]], ...]`，查询失败明确报错 |
 | `get_assure_contract` | `account_id`(可选) | 融资标的（担保品）合约 |
 | `get_enable_short_contract` | `account_id`(可选) | 融券标的合约 |
 | `get_unclosed_compacts` | `account_id`(可选) | 未平仓合约（负债）|
@@ -328,6 +328,13 @@
 | `get_option_subject_position` | `account_id`(可选) | 期权标的持仓 |
 | `get_comb_option` | `account_id`(可选) | 组合期权 |
 | `get_hkt_exchange_rate` | 无 | 港股通汇率 |
+
+历史交易明细查询现严格要求 `start_date`、`end_date` 为有效的 `YYYYMMDD` 字符串，
+且开始日期不得晚于结束日期；旧别名 `datatype`、`start_time`、`end_time` 不再作为输入。
+`detail_type` 默认 `DEAL`，接受 `POSITION`、`ORDER`、`DEAL` 的大小写写法。
+接口按账户配置补充原生 API 必需的账户类型，并保留返回值中的日期分组。
+缺少原生绑定、查询异常或不合法的返回结构会明确报错；只有原生成功返回空序列时才返回空列表，
+不能把读取失败视为“历史上没有委托或成交”的证据。
 
 > **融资融券查询的正确方式**：官方文档明确 `get_trade_detail_data` 的合法 `strDatatype` 只有 6 个（`ACCOUNT`/`POSITION`/`POSITION_STATISTICS`/`ORDER`/`DEAL`/`TASK`）。两融查询必须用上述独立函数，不要传 `"CREDIT"` 等字符串。
 
