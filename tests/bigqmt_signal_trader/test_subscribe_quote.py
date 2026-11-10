@@ -1,15 +1,4 @@
-"""subscribe_quote has to keep firing (issue #95).
-
-It used to invoke the callback exactly once and never again -- a one-shot fetch
-wearing a subscription's name. That is worse than not implementing it: a caller
-written against MiniQMT sees data arrive and concludes it works, then waits
-forever for the second update.
-
-Ticks now ride the whole-quote push channel (a single code is a one-element
-code list). K-lines have no server-side push -- the bridge only exposes
-ContextInfo.subscribe_whole_quote, which carries ticks -- so they are polled
-and emitted when the newest bar changes.
-"""
+"""Tick 保持推送；旧桥接分钟订阅保留轮询，原生 1m 在独立测试中验收。"""
 
 import os
 import sys
@@ -64,7 +53,10 @@ class FakeClient(object):
         self._index = 0
 
     def call(self, method, params=None, **kwargs):
+        """模拟无原生分钟能力的旧桥接，继续提供轮询行情读取。"""
         self.calls.append(method)
+        if method == "ping":
+            return {"pong": True}
         if method == "get_full_tick":
             return {c: {"lastPrice": 1.0} for c in (params or {}).get("codes") or []}
         if method == "get_market_data_ex":

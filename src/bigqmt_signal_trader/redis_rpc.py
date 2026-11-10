@@ -129,9 +129,20 @@ QUOTE_SUBSCRIPTION_METHODS = {
     "subscribe_whole_quote",
     "unsubscribe_whole_quote",
     "quote_keepalive",
+    "subscribe_bar",
+    "subscribe_bar_many",
+    "unsubscribe_bar",
+    "bar_keepalive",
+    "bar_keepalive_many",
+    "unsubscribe_bar_many",
 }
 
 LISTENER_DEFERRED_METHODS = {
+    # 原生句柄创建与释放必须使用 QMT 策略线程；续租仅访问本地状态。
+    "subscribe_bar",
+    "subscribe_bar_many",
+    "unsubscribe_bar",
+    "unsubscribe_bar_many",
     # 批量详情仍在策略线程逐项调用原生 API，只合并传输，不能移到监听线程。
     "get_instruments",
     "sync_positions",
@@ -596,12 +607,17 @@ class BigQmtRpcHandlers:
         return handler(params)
 
     def _handle_ping(self, params):
+        """返回连接代次及当前服务端实际具备的 SDK 能力。"""
+        capabilities = ["execution_context_v1", "account_status_v1"]
+        native_bars = getattr(self.quote_subscription_manager, "native_bars", None)
+        if native_bars is not None and native_bars.supported:
+            capabilities.append("native_minute_push_v1")
         return {
             "pong": True,
             "account_id": self.account_id,
             "allow_order_methods": bool(self.allow_order_methods),
             "rpc_revision": RPC_REVISION,
-            "sdk_capabilities": ["execution_context_v1", "account_status_v1"],
+            "sdk_capabilities": capabilities,
             "generation": self._sdk_generation,
             "version": _deployed_version(),
             "account_type": self._reported_account_type(
@@ -930,6 +946,58 @@ class BigQmtRpcHandlers:
         manager = self._require_quote_manager()
         client_id, sub_id, _codes = self._quote_params(params)
         manager.keepalive(client_id, sub_id)
+        return {}
+
+    def _require_native_bars(self):
+        """获取原生分钟句柄管理器，不使用轮询代替缺失的原生能力。"""
+        manager = getattr(self._require_quote_manager(), "native_bars", None)
+        if manager is None or not manager.supported:
+            raise RuntimeError("native minute push is not configured on this server")
+        return manager
+
+    def _handle_subscribe_bar(self, params):
+        """按客户端订阅编号申请单个原生分钟句柄。"""
+        client_id, sub_id, codes = self._quote_params(params, require_codes=True)
+        if len(codes) != 1:
+            raise ValueError("native minute subscription requires exactly one code")
+        return self._require_native_bars().subscribe(
+            client_id, sub_id, codes[0], str(params.get("period") or "1m"))
+
+    def _handle_unsubscribe_bar(self, params):
+        """释放原生分钟句柄，失败保留服务端租约以便重试清理。"""
+        client_id, sub_id, _codes = self._quote_params(params)
+        self._require_native_bars().unsubscribe(client_id, sub_id)
+        return {}
+
+    def _handle_subscribe_bar_many(self, params):
+        """在同一次策略调度内有界创建分钟句柄，失败回滚本批新增项。"""
+        client_id = str(params.get("client_id") or "").strip()
+        if not client_id:
+            raise ValueError("client_id is required")
+        return self._require_native_bars().subscribe_many(
+            client_id, params.get("subscriptions"), float(params.get("timeout_seconds", 30.0)))
+
+    def _handle_bar_keepalive(self, params):
+        """为指定原生分钟句柄续租，失效订阅明确返回错误。"""
+        client_id, sub_id, _codes = self._quote_params(params)
+        self._require_native_bars().keepalive(client_id, sub_id)
+        return {}
+
+    @staticmethod
+    def _bar_batch_params(params):
+        """校验有界批量控制请求，编号列表最多 256 项。"""
+        client_id, sub_ids = str(params.get("client_id") or "").strip(), params.get("sub_ids")
+        if not client_id or not isinstance(sub_ids, list) or not 0 < len(sub_ids) <= 256:
+            raise ValueError("native minute control requires client and 1..256 subscription ids")
+        return client_id, sub_ids
+
+    def _handle_bar_keepalive_many(self, params):
+        """以一个控制往返续租整批分钟句柄，无需原生 QMT 调用。"""
+        return self._require_native_bars().keepalive_many(*self._bar_batch_params(params))
+
+    def _handle_unsubscribe_bar_many(self, params):
+        """在一次策略调度内释放整批分钟句柄。"""
+        self._require_native_bars().unsubscribe_many(*self._bar_batch_params(params))
         return {}
 
     def _identity_redis(self):

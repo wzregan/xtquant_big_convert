@@ -13,6 +13,7 @@ a ``get_full_tick`` prime on top (done in ``BigQmtXtData.subscribe_whole_quote``
 
 import logging
 import threading
+import time
 
 
 def _norm_topic(code_list):
@@ -21,12 +22,15 @@ def _norm_topic(code_list):
 
 class WholeQuoteClientSession(object):
     def __init__(self, rpc_call, push_channel, client_id, heartbeat_interval_seconds=3.0, sub_id_func=None,
-                 push_silence_replay_heartbeats=10, push_channel_factory=None):
+                 push_silence_replay_heartbeats=10, push_channel_factory=None,
+                 bar_subscribe_batch_size=8, bar_subscribe_timeout_seconds=30.0):
         """保存订阅会话；rpc_call 接受方法及参数，推送通道由本会话启动和停止。
 
         heartbeat_interval_seconds 为心跳秒数；sub_id_func 生成稳定的订阅编号。
         push_silence_replay_heartbeats 为无推送后重放的心跳轮数。
         push_channel_factory 仅供确认型通道损坏后重建，须保留原订阅者身份。
+        bar_subscribe_batch_size 为每次 QMT 调度最多创建的分钟句柄数，范围 1..32。
+        bar_subscribe_timeout_seconds 为整次批订阅的总秒数预算。
         """
         self._rpc = rpc_call
         self._channel = push_channel
@@ -51,6 +55,10 @@ class WholeQuoteClientSession(object):
         self._push_reconciliation_required = False
         self._push_recoveries = 0
         self._push_health_busy = False
+        self._bar_subscribe_batch_size = int(bar_subscribe_batch_size)
+        self._bar_subscribe_timeout = float(bar_subscribe_timeout_seconds)
+        if not 1 <= self._bar_subscribe_batch_size <= 32 or self._bar_subscribe_timeout <= 0:
+            raise ValueError("native minute control batch must be 1..32 and timeout positive")
 
     # -- subscription lifecycle ---------------------------------------------
     def subscribe_whole_quote(self, code_list, callback=None):
@@ -70,31 +78,179 @@ class WholeQuoteClientSession(object):
         return sub_id
 
     def unsubscribe_quote(self, sub_id):
+        """释放指定订阅，分钟订阅使用对应原生控制 RPC。"""
         with self._lock:
             entry = self._subscriptions.pop(sub_id, None)
         if entry is None:
             return 0
         try:
-            self._rpc("unsubscribe_whole_quote", {"client_id": self.client_id, "sub_id": sub_id})
+            self._rpc(entry.get("unsubscribe_method", "unsubscribe_whole_quote"),
+                      {"client_id": self.client_id, "sub_id": sub_id})
         finally:
             with self._lock:
                 self._sync_subscriber_locked()
         return 0
+
+    def subscribe_bar(self, stock_code, callback=None):
+        """先监听固定主题再申请原生分钟句柄，避免同步首个回调丢失。"""
+        from .native_bar_subscription import NativeBarDelivery, bar_topic
+
+        with self._lock:
+            sub_id = self._next_sub_id()
+            delivery = NativeBarDelivery(stock_code, callback)
+            entry = {"topic": bar_topic(self.client_id, sub_id), "callback": delivery,
+                     "codes": [stock_code], "subscribe_method": "subscribe_bar",
+                     "unsubscribe_method": "unsubscribe_bar", "keepalive_method": "bar_keepalive"}
+            self._subscriptions[sub_id] = entry
+            try:
+                self._sync_subscriber_locked()
+            except Exception:
+                self._subscriptions.pop(sub_id, None)
+                raise
+        try:
+            result = self._rpc("subscribe_bar", {
+                "client_id": self.client_id, "sub_id": sub_id, "codes": [stock_code], "period": "1m"})
+            if not isinstance(result, dict) or result.get("native_minute_push") is not True:
+                raise RuntimeError("server did not confirm native minute push")
+            delivery.confirm(result.get("generation"))
+            entry["server_generation"] = result.get("generation")
+            return sub_id
+        except Exception:
+            # 请求超时也可能已经申请成功；尽力撤销，最终仍由服务端租约清理。
+            try:
+                self.unsubscribe_quote(sub_id)
+            except Exception:
+                pass
+            raise
+
+    def unsubscribe_bars(self):
+        """显式释放全部原生分钟订阅，保留 Tick 会话与其订阅。"""
+        with self._lock:
+            sub_ids = [sid for sid, entry in self._subscriptions.items()
+                       if entry.get("subscribe_method") == "subscribe_bar"]
+        self._unsubscribe_bar_ids(sub_ids)
+        return len(sub_ids)
+
+    def unsubscribe_bar_handles(self, sub_ids):
+        """仅批量释放参数中属于原生分钟的句柄，并返回已处理编号集合。"""
+        with self._lock:
+            native_ids = [sid for sid in dict.fromkeys(sub_ids)
+                          if self._subscriptions.get(sid, {}).get("subscribe_method") == "subscribe_bar"]
+        self._unsubscribe_bar_ids(native_ids)
+        return set(native_ids)
+
+    def _unsubscribe_bar_ids(self, sub_ids):
+        """先撤销本地路由，再按 256 项一次释放远端句柄，失败交由租约兜底。"""
+        with self._lock:
+            for sub_id in sub_ids:
+                self._subscriptions.pop(sub_id, None)
+            self._sync_subscriber_locked()
+        for offset in range(0, len(sub_ids), 256):
+            self._rpc("unsubscribe_bar_many", {"client_id": self.client_id, "sub_ids": sub_ids[offset:offset + 256]})
+
+    def subscribe_bars(self, codes, callback=None, timeout_seconds=None):
+        """分短批创建至多 256 个原生订阅，全部批次共用 timeout_seconds 秒预算。"""
+        from .native_bar_subscription import NativeBarDelivery, bar_topic
+
+        codes = list(dict.fromkeys(codes))
+        if not codes or len(codes) > 256 or any(not isinstance(code, str) or not code.strip() for code in codes):
+            raise ValueError("native minute batch requires 1..256 instrument codes")
+        entries, handles = {}, {}
+        with self._lock:
+            for code in codes:
+                sub_id = self._next_sub_id()
+                entry = {"topic": bar_topic(self.client_id, sub_id), "callback": NativeBarDelivery(code, callback),
+                         "codes": [code], "subscribe_method": "subscribe_bar",
+                         "unsubscribe_method": "unsubscribe_bar", "keepalive_method": "bar_keepalive"}
+                entries[sub_id], handles[code] = entry, sub_id
+            self._subscriptions.update(entries)
+            try:
+                self._sync_subscriber_locked()
+            except Exception:
+                for sub_id in entries:
+                    self._subscriptions.pop(sub_id, None)
+                raise
+        try:
+            self._subscribe_bar_batches(list(entries.items()), timeout_seconds)
+            return handles
+        except Exception:
+            try:
+                self._unsubscribe_bar_ids(list(entries))
+            except Exception:
+                pass
+            raise
+
+    def _subscribe_bar_batches(self, items, timeout_seconds=None):
+        """每批默认八项后归还 QMT 调度；原生 C++ 单次调用仍不能被抢占。"""
+        budget = self._bar_subscribe_timeout if timeout_seconds is None else float(timeout_seconds)
+        deadline = time.monotonic() + budget
+        size = self._bar_subscribe_batch_size
+        for offset in range(0, len(items), size):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("native minute subscription deadline exceeded")
+            batch = items[offset:offset + size]
+            results = self._rpc("subscribe_bar_many", {
+                "client_id": self.client_id,
+                "subscriptions": [{"sub_id": sid, "code": entry["codes"][0]} for sid, entry in batch],
+                "timeout_seconds": min(remaining, 30.0),
+            })
+            for sub_id, entry in batch:
+                result = (results or {}).get(str(sub_id))
+                if not isinstance(result, dict) or result.get("native_minute_push") is not True:
+                    raise RuntimeError("server did not confirm complete native minute batch")
+                entry["callback"].confirm(result.get("generation"))
+                with self._lock:
+                    current = self._subscriptions.get(sub_id)
+                    if current is not None:
+                        current["server_generation"] = result.get("generation")
+            if time.monotonic() >= deadline:
+                raise TimeoutError("native minute subscription deadline exceeded")
 
     def has_subscription(self, sub_id):
         with self._lock:
             return sub_id in self._subscriptions
 
     def replay_subscriptions(self):
-        """Re-send subscribe for every active sub_id (server restart recovery).
-        Idempotent on the server (keyed by client_id+combo), so replays are safe."""
+        """重放有效订阅，分钟服务端换代时明确报告缺口而不伪造补齐。"""
         with self._lock:
             items = [(sid, dict(entry)) for sid, entry in self._subscriptions.items()]
+        bars = []
         for sub_id, entry in items:
+            if entry.get("subscribe_method") == "subscribe_bar":
+                # 首次注册尚在其他控制批中执行，心跳不能同时重放尚未确认的句柄。
+                if entry.get("server_generation"):
+                    bars.append((sub_id, entry))
+                continue
             self._rpc(
                 "subscribe_whole_quote",
                 {"client_id": self.client_id, "sub_id": sub_id, "codes": entry["codes"]},
             )
+        self._subscribe_bar_batches(bars)
+
+    def _keepalive_bars(self, items):
+        """每批一次续租，失败逐项通知缺口但不终止唯一心跳线程。"""
+        failures = 0
+        for offset in range(0, len(items), 256):
+            batch = items[offset:offset + 256]
+            try:
+                result = self._rpc("bar_keepalive_many", {
+                    "client_id": self.client_id, "sub_ids": [sid for sid, _entry in batch]})
+                missing = set(result["missing"])
+            except Exception:
+                missing = {str(sid) for sid, _entry in batch}
+            for sub_id, entry in batch:
+                if str(sub_id) not in missing:
+                    continue
+                failures += 1
+                try:
+                    entry["callback"].gap()
+                except Exception as error:
+                    with self._lock:
+                        self._push_callback_failed = True
+                        self._push_reconciliation_required = True
+                        self._push_health_error = "native minute gap callback failed: %s" % error
+        return failures
 
     # -- heartbeat -------------------------------------------------------------
     def start(self):
@@ -162,15 +318,27 @@ class WholeQuoteClientSession(object):
                 self._heartbeat_stop.wait(self._heartbeat_interval)
                 continue
             failures = 0
+            bars = []
             for sub_id in sub_ids:
                 if self._heartbeat_stop.is_set():
                     return
                 try:
+                    with self._lock:
+                        entry = self._subscriptions.get(sub_id)
+                    if entry is None:
+                        continue
+                    if entry.get("subscribe_method") == "subscribe_bar":
+                        if entry.get("server_generation"):
+                            bars.append((sub_id, entry))
+                        continue
                     self._rpc("quote_keepalive", {"client_id": self.client_id, "sub_id": sub_id})
                 except Exception:
                     failures += 1
+            failures += self._keepalive_bars(bars)
             if failures:
                 consecutive_failures += 1
+                # 分钟租约失效可能来自终端重启；不能等所有续租先恢复才尝试重建。
+                self._replay_for_heartbeat()
             elif consecutive_failures >= 3:
                 # Server is back after a restart window: replay subscriptions so
                 # the restarted server re-creates the big-QMT subscriptions (its

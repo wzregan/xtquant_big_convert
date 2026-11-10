@@ -27,12 +27,29 @@ This module does not make trading decisions.
 """
 
 import importlib
+import inspect
+import re
 import time
 
 from ..code_utils import (
     EXCHANGE_TOKENS, FUTURES_MARKET_CODES, instrument_code_flags, normalize_stock_code)
 from ..logging_setup import get_logger
 from ..quote_utils import find_code_payload, is_option_code, latest_quote_row
+
+
+class _MarketDataSignatureError(TypeError):
+    """候选参数均不符合原生签名，允许保留语义的批量读取接口回退。"""
+
+
+def _native_argument_mismatch(error):
+    """只识别明确的 C 扩展参数绑定错误，内部计算的 TypeError 必须直接传播。"""
+    message = str(error)
+    return bool(re.search(
+        r"unexpected keyword argument|takes no keyword arguments|"
+        r"missing .*required (?:positional|keyword-only) argument|"
+        r"takes .*arguments?.*(?:given|got)|"
+        r"incompatible function arguments|did not match C\+\+ signature|"
+        r"arguments did not match any overloaded call", message, re.IGNORECASE))
 from ..reference_data import normalize_instrument_detail
 
 
@@ -479,6 +496,38 @@ class BigQmtMarketDataProvider:
             raise last_error
         raise NotImplementedError("none of the ContextInfo methods is available")
 
+    def _call_market_data_shapes(self, shapes):
+        """仅批量读取预绑定 Python 签名，防止内部错误触发重复原生取数。"""
+        last_error = None
+        signatures = {}
+        for method_name, args, kwargs in shapes:
+            method = getattr(self.context_info, method_name, None)
+            if not callable(method):
+                continue
+            if method_name not in signatures:
+                try:
+                    signatures[method_name] = inspect.signature(method)
+                except (TypeError, ValueError):
+                    signatures[method_name] = None
+            signature = signatures[method_name]
+            if signature is not None:
+                try:
+                    signature.bind(*args, **kwargs)
+                except TypeError as error:
+                    last_error = error
+                    continue
+                # 已确认参数匹配；函数体中的 TypeError 不是另一个签名的探测信号。
+                return method(*args, **kwargs)
+            try:
+                return method(*args, **kwargs)
+            except TypeError as error:
+                if not _native_argument_mismatch(error):
+                    raise
+                last_error = error
+        if last_error is not None:
+            raise _MarketDataSignatureError(str(last_error)) from last_error
+        raise NotImplementedError("none of the ContextInfo market data methods is available")
+
     def _market_data_shapes(self, method_name, **params):
         """生成不同 QMT 版本的调用形式，所有候选都保留是否填充缺失数据的语义。"""
         field_list = list(params.get("field_list") or params.get("fields") or [])
@@ -793,10 +842,10 @@ class BigQmtMarketDataProvider:
         raw_method = getattr(self.context_info, "get_market_data_ex_ori", None)
         if callable(raw_method):
             try:
-                raw_data = self._call_first_supported(
+                raw_data = self._call_market_data_shapes(
                     self._market_data_shapes("get_market_data_ex_ori", **kwargs)
                 )
-            except TypeError:
+            except _MarketDataSignatureError:
                 if kwargs.get("fill_data", True) and kwargs.get("subscribe") is None:
                     raise
             else:
@@ -808,7 +857,7 @@ class BigQmtMarketDataProvider:
         shapes = self._market_data_shapes("get_market_data_ex", **kwargs)
         if kwargs.get("subscribe") is not False and hasattr(self.context_info, "get_market_data"):
             shapes.extend(self._market_data_shapes("get_market_data", **kwargs))
-        return self._call_first_supported(shapes)
+        return self._call_market_data_shapes(shapes)
 
     def get_local_data(self, **kwargs):
         shapes = self._market_data_shapes("get_local_data", **kwargs)

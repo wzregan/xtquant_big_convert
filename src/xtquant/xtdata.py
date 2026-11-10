@@ -10,6 +10,18 @@ def _sdk_quote_callback(callback):
         """保留 Tick 结构；K 线时间缺失时从已规范化的上海时间索引补齐。"""
         payload = {}
         for code, value in data.items():
+            if isinstance(value, dict) and "stime" in value and isinstance(value["stime"], (list, tuple)):
+                # 大 QMT result_type='list' 返回列数组；逐列取值保留数量整数精度。
+                rows = []
+                for index, stamp in enumerate(value["stime"]):
+                    row = {name: values[index] for name, values in value.items()}
+                    parsed = _compat._parse_qmt_stime(stamp)
+                    if parsed is None:
+                        raise ValueError("native bar callback has no valid time")
+                    row["time"] = _compat._qmt_datetime_to_epoch_ms(parsed)
+                    rows.append(row)
+                payload[code] = rows
+                continue
             if not hasattr(value, "itertuples"):
                 payload[code] = value
                 continue
@@ -111,12 +123,22 @@ def subscribe_quote2(stock_code, period="1d", start_time="", end_time="", count=
     return _compat.xtdata.subscribe_quote2(stock_code, period, start_time, end_time, count, dividend_type, _sdk_quote_callback(callback))
 
 
+def subscribe_quote_many(codes, period="1m", callback=None, timeout_seconds=None):
+    """扩展批订阅返回证券到句柄的映射，timeout_seconds 为全部控制批的总预算。"""
+    return _compat.xtdata.subscribe_quote_many(codes, period, _sdk_quote_callback(callback), timeout_seconds)
+
+
 def subscribe_whole_quote(code_list, callback=None):
     return _compat.xtdata.subscribe_whole_quote(code_list, callback=callback)
 
 
 def unsubscribe_quote(seq):
     return _compat.xtdata.unsubscribe_quote(seq)
+
+
+def unsubscribe_quote_many(sequences):
+    """批量退订指定原生分钟句柄，其他周期继续使用已有兼容清理路径。"""
+    return _compat.xtdata.unsubscribe_quote_many(sequences)
 
 
 def run():

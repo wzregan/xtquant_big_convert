@@ -97,6 +97,7 @@ def test_market_connection_is_real_and_idempotent():
         assert data.connect() is True
     assert client.call.call_count == 1
     session = Mock()
+    session.unsubscribe_bars.return_value = 0
     data._quote_session = session
     data.disconnect()
     session.close.assert_called_once()

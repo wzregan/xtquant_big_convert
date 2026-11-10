@@ -1491,6 +1491,7 @@ def auto_sync_enabled():
 
 class BigQmtXtData:
     def __init__(self, client):
+        """保存 RPC 客户端及本实例拥有的行情订阅，断开时释放订阅和传输资源。"""
         self.client = client
         self._subscribe_seq = int(time.time() * 1000)
         self._cache_obj = None
@@ -1500,6 +1501,8 @@ class BigQmtXtData:
         self._bar_poller_lock = threading.Lock()
         self._connection_lock = threading.RLock()
         self._connected_until = 0.0
+        self.native_minute_push = False
+        self._capabilities_checked = False
 
     def connect(self, ip="", port=None, remember_if_success=True):
         """探测桥接连接；一秒内复用探测或真实 RPC 成功记录，避免逐请求重复往返。
@@ -1512,13 +1515,15 @@ class BigQmtXtData:
         with self._connection_lock:
             last_success = getattr(self.client, "_last_rpc_success_monotonic", 0.0)
             recent_rpc_until = last_success + 1.0 if last_success > 0 else 0.0
-            if time.monotonic() < max(self._connected_until, recent_rpc_until):
+            if self._capabilities_checked and time.monotonic() < max(self._connected_until, recent_rpc_until):
                 return True
             self._connected_until = 0.0
             pong = self.client.call("ping")
             if not isinstance(pong, dict) or pong.get("pong") is not True:
                 self.client._last_rpc_success_monotonic = 0.0
                 raise ConnectionError("invalid BigQMT ping response")
+            self.native_minute_push = "native_minute_push_v1" in pong.get("sdk_capabilities", ())
+            self._capabilities_checked = True
             self._connected_until = time.monotonic() + 1.0
             return True
 
@@ -1526,6 +1531,8 @@ class BigQmtXtData:
         """停止本行情对象的订阅并清除连接状态；交易对象拥有独立客户端。"""
         with self._connection_lock:
             self._connected_until = 0.0
+            self.native_minute_push = False
+            self._capabilities_checked = False
             self.client._last_rpc_success_monotonic = 0.0
             self.stop_all_subscriptions()
             session = self._quote_session
@@ -2257,16 +2264,11 @@ class BigQmtXtData:
         return out
 
     def subscribe_quote(self, stock_code, period="1d", start_time="", end_time="", count=0, callback=None):
-        """Subscribe to one instrument, MiniQMT-style: the callback keeps firing.
+        """订阅行情；无历史参数的 1m 在握手确认能力后使用原生推送。
 
-        This used to invoke the callback exactly once and never again -- a
-        one-shot fetch wearing a subscription's name, which is worse than not
-        having it, because it looks like it works (issue #95).
-
-        Ticks ride the whole-quote push channel; a single code is just a
-        one-element code list. K-lines have no server-side push -- the bridge
-        only exposes ContextInfo.subscribe_whole_quote, which carries ticks --
-        so they are polled and emitted when the newest bar changes.
+        非零 count 或 start_time/end_time 沿用旧轮询语义，参数原样传递给取数接口。
+        旧桥接未声明原生能力时同样保留轮询；握手和原生订阅错误直接传播。
+        Tick 沿用全推通道，其余周期保留原有兼容轮询。
         """
         payload = {
             "stock_code": stock_code,
@@ -2289,6 +2291,16 @@ class BigQmtXtData:
                     pass
             self._record_subscription(seq, payload)
             return seq
+
+        if str(period).lower() == "1m" and not start_time and not end_time and count == 0:
+            # 能力缺失才兼容旧轮询；已声明原生能力后的真实错误不能被降级隐藏。
+            self.connect()
+            if self.native_minute_push:
+                session = self._whole_quote_session()
+                session.start()
+                seq = session.subscribe_bar(stock_code, callback=callback)
+                self._record_subscription(seq, payload)
+                return seq
 
         seq = self._next_seq()
 
@@ -2327,6 +2339,21 @@ class BigQmtXtData:
         except (TypeError, ValueError):
             return DEFAULT_BAR_POLL_INTERVAL_SECONDS
 
+    def subscribe_quote_many(self, codes, period="1m", callback=None, timeout_seconds=None):
+        """原生短批订阅至多 256 只分钟行情，timeout_seconds 为整次订阅总秒数预算。
+
+        旧桥接缺少能力时明确抛出 NotImplementedError，调用方可继续使用单只兼容入口。
+        """
+        if period != "1m":
+            raise ValueError("native batch subscriptions only support 1m")
+        self.connect()
+        if not self.native_minute_push:
+            raise NotImplementedError("server does not support native minute batch subscriptions")
+        session = self._whole_quote_session()
+        session.start()
+        handles = session.subscribe_bars(codes, callback, timeout_seconds)
+        return handles
+
     def _record_subscription(self, seq, payload, active=True):
         """Bookkeeping only -- nothing on the server consumes it, and it needs a
         Redis client, which a zmq deployment does not have. Never let it break
@@ -2358,11 +2385,15 @@ class BigQmtXtData:
         return self._quote_session
 
     def _build_quote_session(self):
+        """组装共用推送会话，分钟控制短批使用客户端剩余秒数预算。"""
         from .whole_quote_session import WholeQuoteClientSession
 
         client = self.client
 
         def rpc_call(method, params):
+            """分钟控制批继承剩余总预算，其余控制请求沿用客户端默认值。"""
+            if method == "subscribe_bar_many":
+                return client.call(method, params, timeout_seconds=params.get("timeout_seconds"))
             return client.call(method, params)
 
         return WholeQuoteClientSession(
@@ -2373,6 +2404,8 @@ class BigQmtXtData:
             sub_id_func=self._next_seq,
             push_channel_factory=(self._build_quote_push_channel
                                   if getattr(_client_backend(client), "acknowledged_push", False) else None),
+            bar_subscribe_batch_size=_env_int("BIGQMT_MINUTE_SUBSCRIBE_BATCH_SIZE", 8),
+            bar_subscribe_timeout_seconds=getattr(client, "timeout_seconds", DEFAULT_RPC_TIMEOUT_SECONDS),
         )
 
     def _build_quote_push_channel(self):
@@ -2419,7 +2452,9 @@ class BigQmtXtData:
         return 0
 
     def stop_all_subscriptions(self):
-        """停止所有所属 K 线线程；逐个清理并保留未退出句柄，不隐瞒残留消费者。"""
+        """释放原生分钟句柄及兼容轮询；保留未退出资源，不隐瞒清理失败。"""
+        session = getattr(self, "_quote_session", None)
+        native_count = session.unsubscribe_bars() if session is not None else 0
         with self._bar_poller_lock:
             pollers = list(self._bar_pollers.items())
         failures = []
@@ -2434,7 +2469,17 @@ class BigQmtXtData:
                     self._bar_pollers.pop(seq)
         if failures:
             raise RuntimeError("BigQMT bar subscriptions did not stop: %s" % failures[0])
-        return len(pollers)
+        return len(pollers) + native_count
+
+    def unsubscribe_quote_many(self, sequences):
+        """释放指定句柄；原生分钟合并控制请求，其余订阅沿用单项兼容路径。"""
+        sequences = list(dict.fromkeys(sequences))
+        session = self._quote_session
+        native = session.unsubscribe_bar_handles(sequences) if session is not None else set()
+        for seq in sequences:
+            if seq not in native:
+                self.unsubscribe_quote(seq)
+        return 0
 
     def run(self):
         while True:

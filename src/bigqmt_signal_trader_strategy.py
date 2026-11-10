@@ -412,7 +412,12 @@ def reset_app():
                         pass
             manager._combos.clear()
             manager._sub_index.clear()
-            channel.stop()
+            native_bars = getattr(manager, "native_bars", None)
+            try:
+                if native_bars is not None:
+                    native_bars.close()
+            finally:
+                channel.stop()
         except Exception:
             pass
     _quote_subscription_service = None

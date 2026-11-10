@@ -189,6 +189,7 @@ class QuoteSubscriptionManager(object):
         self._lock = threading.RLock()
         self._combos = {}            # combo_key -> _Combo
         self._sub_index = {}         # (client_id, sub_id) -> combo_key
+        self.native_bars = None
 
     # -- subscription lifecycle ---------------------------------------------
     def subscribe(self, client_id, sub_id, code_list):
@@ -257,6 +258,8 @@ class QuoteSubscriptionManager(object):
                         reaped += 1
         for handle in handles_to_close:
             self._close_source(handle)
+        if self.native_bars is not None:
+            reaped += self.native_bars.reap_expired(now)
         return reaped
 
     # -- internals -------------------------------------------------------------
@@ -709,6 +712,11 @@ def build_quote_subscription_service(
             source, heartbeat_timeout_seconds=heartbeat_timeout_seconds,
             time_func=time_func, on_push_publisher=channel.publish,
             push_endpoint=channel.publisher_endpoint,
+        )
+        from .native_bar_subscription import NativeBarSubscriptions
+
+        manager.native_bars = NativeBarSubscriptions(
+            context_info, channel.publish, heartbeat_timeout_seconds, time_func,
         )
     except Exception:
         # 通道工厂可能已分配原生资源，后续组装失败也要归还所有权。

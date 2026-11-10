@@ -158,8 +158,15 @@ class OlderTerminalStillWorksTest(unittest.TestCase):
             self.assertIs(kwargs.get("fill_data", args[7] if len(args) > 7 else None), False)
 
     def test_a_terminal_rejecting_the_big_names_still_reaches_a_shape(self):
-        """The whole point of the shape list -- do not narrow it."""
+        """严格 Python 签名只接受 SDK 名称时，预绑定跳过错误形式且只实际调用一次。"""
         context = Recorder(reject={"fields", "stock_code"})
+
+        def legacy(field_list, stock_list, period, start_time, end_time, count, dividend_type, fill_data):
+            """模拟真实参数绑定错误，而非函数体内部主动抛出的 TypeError。"""
+            return context._record("get_market_data_ex", (), {
+                "field_list": field_list, "stock_list": stock_list, "fill_data": fill_data})
+
+        context.get_market_data_ex = legacy
 
         result = _provider(context).get_market_data_ex(
             field_list=[], stock_list=["600000.SH"], period="1d",
@@ -167,6 +174,7 @@ class OlderTerminalStillWorksTest(unittest.TestCase):
 
         self.assertTrue(result)
         self.assertFalse(context.calls[-1]["rejected"])
+        self.assertEqual(len(context.calls), 1)
 
 
 class ShapeOrderTest(unittest.TestCase):
