@@ -855,7 +855,7 @@ class UseFormulaBypassTest(unittest.TestCase):
         compat_mod._BarPoller = _P
         try:
             xt.get_market_data_ex = spy
-            xt.subscribe_quote("600000.SH", period="1m", count=1, callback=None)
+            xt.subscribe_quote("600000.SH", period="5m", count=1, callback=None)
         finally:
             compat_mod._BarPoller = _BarPoller
 

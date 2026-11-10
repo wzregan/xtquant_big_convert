@@ -283,7 +283,7 @@ def test_rpc_capability_and_native_thread_affinity(registry):
 
 @pytest.fixture
 def captured_pollers(monkeypatch):
-    """记录旧轮询实际取数参数，不依赖后台线程的调度时序。"""
+    """捕获意外创建的轮询对象，证明分钟错误路径没有偷偷启动线程。"""
     pollers = []
     class Poller:
         """只捕获取数入口，生命周期仍由正式 SDK 管理。"""
@@ -304,39 +304,31 @@ def captured_pollers(monkeypatch):
 @pytest.mark.parametrize("window", [{"start_time": "20261110"}, {"end_time": "20261111"},
                                     {"count": 30}, {"count": -1}])
 @pytest.mark.parametrize("capable", [False, True])
-def test_minute_history_arguments_preserve_legacy_polling(window, capable, captured_pollers):
-    """已有分钟历史参数继续原样传给轮询读取，即使服务端支持原生推送。"""
+def test_minute_history_arguments_fail_before_handshake_or_polling(window, capable, captured_pollers):
+    """分钟历史参数在握手前明确拒绝，即使服务端支持原生也不能轮询。"""
     from unittest.mock import Mock
-    sdk = BigQmtXtData(SimpleNamespace())
+    client = SimpleNamespace(call=Mock())
+    sdk = BigQmtXtData(client)
     sdk.native_minute_push = capable
-    sdk.get_market_data_ex = Mock(return_value={})
-    handle = sdk.subscribe_quote("x", "1m", **window)
-    captured_pollers[0].fetch()
-    params = sdk.get_market_data_ex.call_args.kwargs
-    assert params["period"] == "1m" and params["fill_data"] is False and params["use_formula"] is False
-    assert all(params[name] == value for name, value in window.items())
-    assert captured_pollers[0].started and sdk.native_minute_push is capable
-    sdk.unsubscribe_quote(handle)
-    assert captured_pollers[0].stopped and not sdk._bar_pollers
+    with pytest.raises(ValueError, match="count=0 and no history window"):
+        sdk.subscribe_quote("x", "1m", **window)
+    client.call.assert_not_called()
+    assert not captured_pollers and not sdk._bar_pollers and sdk._quote_session is None
 
 
-def test_default_minute_subscription_on_old_bridge_keeps_polling(captured_pollers):
-    """旧桥接无能力声明时默认分钟订阅继续工作，且不冒充原生推送。"""
+def test_default_minute_subscription_without_native_capability_never_polls(captured_pollers):
+    """缺少原生能力时默认分钟订阅明确失败，不再提供轮询回退。"""
     from unittest.mock import Mock
     client = SimpleNamespace(call=Mock(return_value={"pong": True}))
     sdk = BigQmtXtData(client)
-    sdk.get_market_data_ex = Mock(return_value={})
-    handle = sdk.subscribe_quote("x", "1m")
+    with pytest.raises(NotImplementedError, match="does not support native minute"):
+        sdk.subscribe_quote("x", "1m")
     client.call.assert_called_once_with("ping")
-    captured_pollers[0].fetch()
-    assert sdk.get_market_data_ex.call_args.kwargs["count"] == 2
-    assert sdk.native_minute_push is False and sdk._quote_session is None
-    sdk.unsubscribe_quote(handle)
-    assert captured_pollers[0].stopped
+    assert not captured_pollers and sdk.native_minute_push is False and sdk._quote_session is None
 
 
 def test_old_bridge_rejects_explicit_native_batch_before_creating_handles(captured_pollers):
-    """新增原生批入口明确报告能力缺失，调用方可选旧单只入口。"""
+    """原生批入口明确报告能力缺失，不产生单只订阅或轮询。"""
     from unittest.mock import Mock
     client = SimpleNamespace(call=Mock(return_value={"pong": True}))
     sdk = BigQmtXtData(client)

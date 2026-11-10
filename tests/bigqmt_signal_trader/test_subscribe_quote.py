@@ -1,4 +1,4 @@
-"""Tick 保持推送；旧桥接分钟订阅保留轮询，原生 1m 在独立测试中验收。"""
+"""Tick 保持推送；非 1m 周期保留轮询，原生 1m 在独立测试中验收。"""
 
 import os
 import sys
@@ -53,7 +53,7 @@ class FakeClient(object):
         self._index = 0
 
     def call(self, method, params=None, **kwargs):
-        """模拟无原生分钟能力的旧桥接，继续提供轮询行情读取。"""
+        """提供非 1m 轮询测试所需行情及握手响应。"""
         self.calls.append(method)
         if method == "ping":
             return {"pong": True}
@@ -151,7 +151,7 @@ class BarSubscriptionTest(unittest.TestCase):
         data = _xtdata(client)
         seen = []
 
-        seq = data.subscribe_quote("600000.SH", period="1m", callback=seen.append)
+        seq = data.subscribe_quote("600000.SH", period="5m", callback=seen.append)
         try:
             self.assertTrue(self._wait(lambda: len(seen) >= 2),
                             "second bar never delivered: %r" % (seen,))
@@ -163,7 +163,7 @@ class BarSubscriptionTest(unittest.TestCase):
         data = _xtdata(client)
         seen = []
 
-        seq = data.subscribe_quote("600000.SH", period="1m", callback=seen.append)
+        seq = data.subscribe_quote("600000.SH", period="5m", callback=seen.append)
         try:
             time.sleep(0.3)   # several poll intervals
             self.assertEqual(len(seen), 1, "re-emitted an unchanged bar")
@@ -174,7 +174,7 @@ class BarSubscriptionTest(unittest.TestCase):
         client = FakeClient()
         data = _xtdata(client)
 
-        seq = data.subscribe_quote("600000.SH", period="1m", callback=lambda d: None)
+        seq = data.subscribe_quote("600000.SH", period="5m", callback=lambda d: None)
         data.unsubscribe_quote(seq)
         before = len(client.calls)
         time.sleep(0.3)
@@ -193,7 +193,7 @@ class BarSubscriptionTest(unittest.TestCase):
             calls.append(1)
             raise RuntimeError("subscriber bug")
 
-        seq = data.subscribe_quote("600000.SH", period="1m", callback=boom)
+        seq = data.subscribe_quote("600000.SH", period="5m", callback=boom)
         try:
             self.assertTrue(self._wait(lambda: len(calls) >= 2),
                             "polling stopped after the first raise")
@@ -242,7 +242,7 @@ class BarSubscriptionTest(unittest.TestCase):
         data = _xtdata(client)
         before = set(threading.enumerate())
 
-        seq = data.subscribe_quote("600000.SH", period="1m", callback=lambda d: None)
+        seq = data.subscribe_quote("600000.SH", period="5m", callback=lambda d: None)
         try:
             new = [t for t in threading.enumerate() if t not in before]
             self.assertTrue(new, "no polling thread started")
@@ -253,7 +253,7 @@ class BarSubscriptionTest(unittest.TestCase):
     def test_stop_all_subscriptions_clears_every_poller(self):
         data = _xtdata(FakeClient())
         for _ in range(3):
-            data.subscribe_quote("600000.SH", period="1m", callback=lambda d: None)
+            data.subscribe_quote("600000.SH", period="5m", callback=lambda d: None)
 
         self.assertEqual(data.stop_all_subscriptions(), 3)
         self.assertEqual(data.stop_all_subscriptions(), 0)
@@ -304,7 +304,7 @@ class NoDataDiagnosticTest(unittest.TestCase):
         import logging
 
         with self.assertLogs("bigqmt.xtquant_compat", level=logging.WARNING) as caught:
-            seq = data.subscribe_quote("600000.SH", period="1m",
+            seq = data.subscribe_quote("600000.SH", period="5m",
                                        callback=lambda d: None)
             try:
                 self.assertTrue(self._wait(lambda: bool(caught.output)))
@@ -312,7 +312,7 @@ class NoDataDiagnosticTest(unittest.TestCase):
                 data.unsubscribe_quote(seq)
 
         message = "".join(caught.output)
-        self.assertIn("no 1m bars", message)
+        self.assertIn("no 5m bars", message)
         self.assertIn("600000.SH", message)
 
     def test_it_is_reported_once_not_every_poll(self):
@@ -333,7 +333,7 @@ class NoDataDiagnosticTest(unittest.TestCase):
         data = _xtdata(client)
         seen = []
 
-        seq = data.subscribe_quote("600000.SH", period="1m", callback=seen.append)
+        seq = data.subscribe_quote("600000.SH", period="5m", callback=seen.append)
         try:
             self.assertTrue(self._wait(lambda: len(seen) >= 1),
                             "never recovered once data appeared")

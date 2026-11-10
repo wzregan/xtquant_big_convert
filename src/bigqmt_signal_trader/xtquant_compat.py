@@ -2264,11 +2264,10 @@ class BigQmtXtData:
         return out
 
     def subscribe_quote(self, stock_code, period="1d", start_time="", end_time="", count=0, callback=None):
-        """订阅行情；无历史参数的 1m 在握手确认能力后使用原生推送。
+        """订阅行情；1m 必须在握手确认能力后使用原生推送，不进入轮询。
 
-        非零 count 或 start_time/end_time 沿用旧轮询语义，参数原样传递给取数接口。
-        旧桥接未声明原生能力时同样保留轮询；握手和原生订阅错误直接传播。
-        Tick 沿用全推通道，其余周期保留原有兼容轮询。
+        1m 只接受 count=0 和空 start_time/end_time，历史窗口使用独立批量读取。
+        缺少原生能力明确失败，握手和订阅错误直接传播；Tick 及其他周期沿用原路径。
         """
         payload = {
             "stock_code": stock_code,
@@ -2292,26 +2291,29 @@ class BigQmtXtData:
             self._record_subscription(seq, payload)
             return seq
 
-        if str(period).lower() == "1m" and not start_time and not end_time and count == 0:
-            # 能力缺失才兼容旧轮询；已声明原生能力后的真实错误不能被降级隐藏。
+        if str(period).lower() == "1m":
+            if start_time or end_time or count != 0:
+                raise ValueError("native 1m subscription requires count=0 and no history window")
             self.connect()
-            if self.native_minute_push:
-                session = self._whole_quote_session()
-                session.start()
-                seq = session.subscribe_bar(stock_code, callback=callback)
-                self._record_subscription(seq, payload)
-                return seq
+            if not self.native_minute_push:
+                raise NotImplementedError("server does not support native minute subscriptions")
+            session = self._whole_quote_session()
+            session.start()
+            seq = session.subscribe_bar(stock_code, callback=callback)
+            self._record_subscription(seq, payload)
+            return seq
 
         seq = self._next_seq()
 
         def fetch():
+            """仅为非 1m 周期读取实时数据，保持其已有轮询参数语义。"""
             # 盘中形成 bar 必须读 QMT 实时数据——FormulaServer 快照可能滞后数
             # 小时（实测 11:30 后冻结，收盘后还停在午间数据），订阅推送如果走
             # 直连会把"刚完成的 bar"发成数小时前的旧快照（issue #104 实测）。
             return self.get_market_data_ex(
                 stock_list=[stock_code], period=period,
                 start_time=start_time, end_time=end_time,
-                count=count or (2 if period == "1m" else 1),
+                count=count or 1,
                 fill_data=False, use_formula=False)
 
         poller = _BarPoller(
@@ -2342,7 +2344,7 @@ class BigQmtXtData:
     def subscribe_quote_many(self, codes, period="1m", callback=None, timeout_seconds=None):
         """原生短批订阅至多 256 只分钟行情，timeout_seconds 为整次订阅总秒数预算。
 
-        旧桥接缺少能力时明确抛出 NotImplementedError，调用方可继续使用单只兼容入口。
+        缺少原生能力时明确抛出 NotImplementedError，不回退单只调用或轮询。
         """
         if period != "1m":
             raise ValueError("native batch subscriptions only support 1m")

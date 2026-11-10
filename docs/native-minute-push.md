@@ -6,12 +6,12 @@
 
 - `ping.sdk_capabilities` 在当前 ContextInfo 提供原生订阅及退订方法时包含 `native_minute_push_v1`。
 - `xtdata.native_minute_push` 为普通布尔属性，`connect()` 握手后更新；读取属性不执行 RPC。
-- `subscribe_quote(code, period="1m", count=0, callback=...)` 在没有历史起止参数且握手确认能力时使用原生 `ContextInfo.subscribe_quote(code, "1m", "none", "list", callback)`。非零 count 或历史起止参数保留原有轮询行为，参数原样传给取数接口；新调用宜使用独立批量读取接口获取历史。
+- `subscribe_quote(code, period="1m", count=0, callback=...)` 在握手确认能力后使用原生 `ContextInfo.subscribe_quote(code, "1m", "none", "list", callback)`。1m 只接受 `count=0` 和空历史起止参数，否则明确抛出 `ValueError`；历史窗口使用独立批量读取接口。
 - `subscribe_quote_many(codes, period="1m", callback=..., timeout_seconds=None)` 返回证券到本地订阅句柄的映射。一次 SDK 调用最多 256 只，失败释放本次申请的所有句柄；回滚失败的服务端句柄由租约清理继续回收。
 - `unsubscribe_quote(handle)` 释放单项；`unsubscribe_quote_many(handles)` 仅批退订给定的原生分钟句柄，未选订阅保持有效，Tick 继续使用已有清理路径。
 - 历史读取仍保持 `get_market_data_ex(..., subscribe=False)`，不会隐式产生订阅。
 
-Tick 和其他周期保持现有路径。旧桥接握手没有原生能力时，单只 1m 保留原有轮询且 `native_minute_push` 为 False；新增原生批订阅入口明确抛出 `NotImplementedError`，qmt-grpc 对明确 False 的后端选择旧单只入口。握手失败或已确认能力后的原生订阅失败直接传播，不降级为轮询。
+Tick 和其他周期保持现有路径。单只与批量 1m 订阅都必须具备原生能力：握手未声明能力时明确抛出 `NotImplementedError`，且 `native_minute_push` 保持 False。握手失败或原生订阅失败直接传播；所有 1m 请求均不降级为轮询，qmt-grpc 也不会在能力缺失时绕过此要求。
 
 ## 调度与资源边界
 
